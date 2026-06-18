@@ -1,16 +1,16 @@
 {
   "manifest_version": 2,
   "version": "1.0.0",
-  "name": "麦麦群主/管理",
-  "description": "LLM自主管理的QQ群管理插件，支持禁言、踢人、设精、公告、审批入群等",
+  "name": "群管理助手",
+  "description": "LLM自主群管理插件 — 18个管理工具+15条快捷命令，支持禁言/踢人/设精华/公告/审批入群等，含8步安全校验护栏，按群独立配置",
   "author": {
-    "name": "DeepSeek-V4",
-    "url": "https://github.com/DeepSeek-V4-Pro"
+    "name": "MaiBot Community",
+    "url": "https://github.com/MaiM-with-u"
   },
   "license": "GPL-v3.0-or-later",
   "urls": {
-    "repository": "https://github.com/DeepSeek-V4-Pro/maimai_group_admin",
-    "homepage": "https://github.com/DeepSeek-V4-Pro/maimai_group_admin"
+    "repository": "https://github.com/MaiM-with-u/maibot",
+    "homepage": "https://github.com/MaiM-with-u/maibot"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -32,5 +32,5 @@
     "default_locale": "zh-CN",
     "supported_locales": ["zh-CN"]
   },
-  "id": "deepseek-v4-pro.group-admin"
+  "id": "maimai.group-admin"
 }

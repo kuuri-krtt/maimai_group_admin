@@ -17,8 +17,6 @@ bot_qq = ""
 
 [auto_moderate]
 enabled = true
-mode = "inline"
-throttle_seconds = 5
 re_inject_interval_messages = 10
 re_inject_interval_seconds = 1800
 enabled_groups = []
@@ -47,12 +45,6 @@ ad_warn_window = 1800
 enabled = true
 escalation_steps = []
 
-[notification]
-public_notify = true
-public_style = "playful"
-admin_dm_on_severe = true
-daily_summary = false
-
 [auto_approve]
 enabled = false
 default_action = "ignore"
@@ -62,29 +54,20 @@ max_pending_seconds = 300
 daily_approve_limit = 5
 daily_reject_limit = 10
 check_interval_seconds = 120
-group_actions = {}
-group_reject_keywords = {}
-group_require_keywords = {}
-group_limits = {}
+groups = []
 
-# [auto_approve.group_actions]
-# "123456789" = "approve"
-
-# [auto_approve.group_reject_keywords]
-# "123456789" = ["广告", "推广"]
-
-# [auto_approve.group_limits]
-# "123456789" = [5, 10]
+# [[auto_approve.groups]]
+# group_id = "123456789"
+# default_action = "approve"
+# require_keywords = []
+# reject_keywords = ["广告", "推广"]
+# daily_approve_limit = 5
+# daily_reject_limit = 10
 
 [logging]
 max_log_entries = 200
-log_skip_decisions = false
 default_log_lines = 10
 
 [prompts]
-auto_moderate_system = "【角色】你是本群的{bot_role}「{bot_nickname}」，当前群号: {group_name}。\n  可用操作: {available_actions}\n\n【职责】实时监控群聊，对违规行为采取渐进式处罚：口头提醒 → 正式警告 → 禁言 → 踢出。\n\n【处罚标准】(duration 单位为秒)\n  广告/诈骗/钓鱼链接 → 立即撤回 + 禁言 600~1800秒(10~30分钟)\n  刷屏(连续5+条相同/相似内容) → 先口头提醒，继续刷则禁言 300~600秒(5~10分钟)\n  人身攻击/辱骂/引战 → 撤回 + 禁言 3600~21600秒(1~6小时)，24h内再犯直接踢出\n  色情/血腥/违法内容 → 立即撤回 + 踢出(零容忍)\n  恶意刷表情/长图刷屏 → 口头提醒后禁言 300~600秒(5~10分钟)\n  高质量内容、技术分享、精彩创作 → 可设精华鼓励\n  轻微擦边/不确定内容 → 仅观察，不主动操作\n\n【调工具前须知】\n  禁言/警告: 直接传 group_id 和 user_id 即可\n  踢人: 必须先调 group_get_member 确认目标不是群主/管理员\n  撤回/设精华: 需要 message_id，请用户在群里回复(引用)目标消息后获取\n  入群审批: 先调 group_get_system_msg 获取 request_id\n  删除公告: 先调 group_get_notice 获取公告列表和 notice_id, 再用 group_delete_notice 删除\n\n【注意】\n  1. 无需操作时直接跳过，不要生成「审查完毕/无异常」之类的回复\n  2. user_id 从消息的 @mention 或内容中提取，群号已在上方给出\n  3. 禁言/踢人拦截时(如目标在保护名单)，告知原因即可"
-mute_response_style = "活泼俏皮，用「小黑屋」「禁言套餐」等趣味表达，附带原因和时长"
-kick_response_style = "严肃但不凶，说明踢出原因"
-essence_response_style = "简洁夸奖，肯定分享价值"
-admin_notify_template = "【管理操作通知】\n群：{group_name}({group_id})\n操作：{action}\n目标：{target_name}({target_id})\n原因：{reason}\n操作者：{operator}\n时间：{timestamp}"
+auto_moderate_system = "【角色】你是本群的{bot_role}「{bot_nickname}」，当前群号: {group_name}。\n  可用操作: {available_actions}\n\n【职责】实时监控群聊，对违规行为采取渐进式处罚：口头提醒 → 正式警告 → 禁言 → 踢出。\n\n【处罚标准】(duration 单位为秒)\n  广告/诈骗/钓鱼链接 → 立即撤回 + 禁言 600~1800秒(10~30分钟)\n  刷屏(连续5+条相同/相似内容) → 先口头提醒，继续刷则禁言 300~600秒(5~10分钟)\n  人身攻击/辱骂/引战 → 撤回 + 禁言 3600~21600秒(1~6小时)，24h内再犯直接踢出\n  色情/血腥/违法内容 → 立即撤回 + 踢出(零容忍)\n  恶意刷表情/长图刷屏 → 口头提醒后禁言 300~600秒(5~10分钟)\n  高质量内容、技术分享、精彩创作 → 可设精华鼓励\n  轻微擦边/不确定内容 → 仅观察，不主动操作\n\n【调工具前须知】\n  禁言/警告: 直接传 group_id 和 user_id 即可\n  踢人: 仅群主可直接踢人。如你为管理员，需先征求群主或bot管理员同意。必须先调 group_get_member 确认目标\n  撤回/设精华: 需要 message_id，请用户在群里回复(引用)目标消息后获取\n  入群审批: 先调 group_get_system_msg 获取 request_id\n  删除公告: 先调 group_get_notice 获取公告列表和 notice_id, 再用 group_delete_notice 删除\n\n【注意】\n  1. 无需操作时直接跳过，不要生成「审查完毕/无异常」之类的回复\n  2. user_id 从消息的 @mention 或内容中提取，群号已在上方给出\n  3. 禁言/踢人拦截时(如目标在保护名单)，告知原因即可"
 command_denied_message = "你没有权限执行此操作。"
