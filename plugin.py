@@ -1010,37 +1010,41 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.get_group_system_msg", group_id=self._to_int(group_id))
                 now = datetime.now()
                 if ok and isinstance(data, dict):
-                    inner = data.get("data", data)
-                    if not isinstance(inner, dict):
-                        inner = {}
+                    items = data.get("data", data)
+                    if not isinstance(items, list):
+                        items = [items] if items else []
                     max_age = self.config.auto_approve.max_pending_seconds
-                    join_requests = inner.get("join_requests", inner.get("JoinRequest", []))
-                    if not isinstance(join_requests, list):
-                        join_requests = [join_requests] if join_requests else []
-                    invites = inner.get("invited_requests", inner.get("InvitedRequest", []))
-                    if not isinstance(invites, list):
-                        invites = [invites] if invites else []
-                    notices = inner.get("notices", inner.get("Notices", []))
-                    if not isinstance(notices, list):
-                        notices = [notices] if notices else []
+                    all_join = []
+                    all_invites = []
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        jl = item.get("join_requests", item.get("JoinRequest", []))
+                        if not isinstance(jl, list):
+                            jl = [jl] if jl else []
+                        all_join.extend(jl)
+                        il = item.get("invited_requests", item.get("InvitedRequest", []))
+                        if not isinstance(il, list):
+                            il = [il] if il else []
+                        all_invites.extend(il)
                     result_parts = []
-                    if join_requests:
+                    if all_join:
                         filtered = []
-                        for item in join_requests:
-                            if isinstance(item, dict):
-                                ts = item.get("time", item.get("timestamp", 0))
+                        for req in all_join:
+                            if isinstance(req, dict):
+                                ts = req.get("time", req.get("timestamp", now.timestamp()))
                                 try:
                                     req_time = datetime.fromtimestamp(float(ts))
                                     if (now - req_time).total_seconds() <= max_age:
-                                        filtered.append(item)
+                                        filtered.append(req)
                                 except Exception:
-                                    filtered.append(item)
+                                    filtered.append(req)
                             else:
-                                filtered.append(item)
+                                filtered.append(req)
                         if filtered:
                             result_parts.append(f"入群申请({len(filtered)}条): {filtered}")
-                    if invites:
-                        result_parts.append(f"邀请入群({len(invites)}条): {invites}")
+                    if all_invites:
+                        result_parts.append(f"邀请入群({len(all_invites)}条): {all_invites}")
                     if result_parts:
                         return {"name": "group_get_system_msg", "content": "\n".join(result_parts)}
                     return {"name": "group_get_system_msg", "content": "当前没有待处理的入群申请或邀请（公告请用 group_get_notice 获取）"}
