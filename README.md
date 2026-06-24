@@ -1,6 +1,6 @@
 # 群管理助手 — LLM 自主管理 QQ 群插件
 
-**18 个管理 Tool + 15 条快捷命令**，让 Bot 自动监控群聊、识别违规并执行管理操作（禁言、踢人、撤回、设精华、公告、审批入群等），同时提供人类管理员的命令控制台。
+**v1.1 | 18 个管理 Tool + 15 条快捷命令 + 2 个 HookHandler 守门**，让 Bot 自主监控群聊、识别违规并执行管理操作（禁言、踢人、撤回、设精华、公告、审批入群等），同时提供人类管理员的命令控制台。
 
 ---
 
@@ -268,6 +268,7 @@ WebUI → 插件管理 → 找到 `maimai.group-admin` → 点击启用
 |------|------|--------|------|
 | `max_log_entries` | int | `2000` | 内存中保留的操作日志最大条数（超过后自动丢弃旧记录） |
 | `default_log_lines` | int | `10` | `/admin log` 不加行数参数时的默认显示行数 |
+| `verbose_logging` | bool | `false` | **v1.1 新增**。开启后输出完整注入 prompt 和守门详情到 INFO 日志，用于排查提示词效果 |
 
 ---
 
@@ -275,18 +276,20 @@ WebUI → 插件管理 → 找到 `maimai.group-admin` → 点击启用
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `auto_moderate_system` | string | (长文本) | LLM 自动审核的系统提示词，决定 Bot 的判断标准和行为准则。可自定义 |
+| `auto_moderate_system` | string | (长文本) | **v1.1 重写**为行为参考指南式 prompt，开头声明"保持原本人设"，强调融入语气而非切换管理员口吻。可自定义 |
 | `command_denied_message` | string | `"你没有权限执行此操作。"` | 非授权用户尝试使用管理命令时的回复内容（仅 deny_response="reply" 时生效） |
 
-> `auto_moderate_system` 支持的模板变量：`{bot_role}`（群主/管理员/普通成员）、`{bot_nickname}`、`{group_name}`、`{available_actions}`
+> `auto_moderate_system` 支持的模板变量：`{bot_role}`（群主/管理员/普通成员）、`{available_actions}`（动态可用工具列表）
 
 ---
 
 ## 功能详解
 
-### 一、LLM 自动管理层（18 个 Tool）
+### 一、LLM 自动管理层（18 个 Tool + 2 个 HookHandler）
 
-Bot 通过注入管理上下文 prompt，使 LLM 具备群管理意识。当检测到违规行为时，LLM 会自主调用管理 Tool。
+Bot 通过 `maisaka.replyer.before_request` HookHandler 在每次生成回复前向 `extra_prompt` 注入管理上下文，使 LLM 在任何回复中都具备群管理意识。当检测到违规行为时，LLM 自主调用管理 Tool；回复后 `after_response` HookHandler 守门检查是否有不当管理行为。
+
+> **v1.1 变更**：提示词注入从 `EventHandler + context.append`（v1.0）迁移到 `HookHandler + extra_prompt`（v1.1），解决了注入内容被上下文冲淡、与人设 prompt 冲突的问题。
 
 #### 写操作（14 个）
 
@@ -448,45 +451,50 @@ check_interval_seconds = 60
 
 ### 五、提示词系统
 
+#### 注入架构（v1.1）
+
+```
+消息到达 → EventHandler(追踪: 映射群号/计数/角色缓存)
+                │
+Replyer 生成回复前
+    ├── HookHandler: before_request → extra_prompt 注入管理 prompt
+    │       └── 每次回复都注入，确保 LLM 100% 可见
+    │
+    └── HookHandler: after_response → 守门检查
+            └── Bot 有管理权限却说"没权限"时自动替换回复
+```
+
 #### 管理上下文 Prompt（auto_moderate_system）
 
-每次注入时自动替换模板变量 `{bot_role}` `{bot_nickname}` `{group_name}` `{available_actions}`：
+v1.1 重写为**行为参考指南**而非规章制度，明确要求保持人设、融入语气，避免与 Bot 的 persona prompt 冲突。
+
+注入时自动替换模板变量 `{bot_role}` `{available_actions}`：
 
 ```
-【角色】你是本群的{bot_role}「{bot_nickname}」，当前群号: {group_name}。
-  可用操作: {available_actions}
+【群管理行为参考 — 请在保持你原本人设和说话风格的前提下使用以下规则】
 
-【职责】实时监控群聊，对违规行为采取渐进式处罚。
+你是本群的{bot_role}，拥有这些管理工具：{available_actions}。
 
-【处罚标准】(duration 单位为秒)
-  广告/诈骗/钓鱼链接 → 立即撤回 + 禁言 600~1800秒(10~30分钟)
-  刷屏 → 先口头提醒，继续刷则禁言 300~600秒(5~10分钟)
-  人身攻击/辱骂 → 撤回 + 禁言 3600~21600秒(1~6小时)，24h内再犯踢出
-  色情/违法 → 立即撤回 + 踢出(零容忍)
-  高质量内容 → 可设精华鼓励
+违规处理参考（以人设语气自然执行，不要切换成'管理员口吻'）：
+  广告/诈骗链接 → 撤回，可视情况禁言10-30分钟
+  连续刷屏 → 用你的人设语气提醒一句，继续刷再禁言5-10分钟
+  辱骂/人身攻击 → 撤回，禁言1-6小时，再犯可踢出
+  色情/违法内容 → 撤回并踢出
+  高质量分享 → 可以用设精华的方式表达赞赏
+  不确定的擦边内容 → 先观察，别着急动手
 
-【调工具前须知】
-  禁言/警告: 直接传 group_id 和 user_id 即可
-  踢人: 仅群主可直接踢人。如你为管理员，需先征求群主或bot管理员同意
-  撤回/设精华: 需要 message_id，请用户在群里回复(引用)目标消息后获取
-  入群审批: 先调 group_get_system_msg 获取 request_id
-  删除公告: 先调 group_get_notice 获取公告列表和 notice_id
+操作提示：
+  警告和禁言直接调用工具，参数填 group_id 和 user_id
+  踢人前务必先调 group_get_member 确认目标身份
+  撤回和设精华需要 message_id，让用户回复目标消息后获取
 
-【注意】
-  无需操作时直接跳过，不要生成「审查完毕/无异常」之类的回复
+节奏控制：
+  正常聊天时做你自己，别主动进入'审查模式'
+  只在确实发现违规时才动用工具，不要生成'无异常'之类的报告
+  管理操作融入你的人设语气，不要说'已将xxx禁言'，用一个自然的方式带过就好
 ```
 
-#### 管理助手指令（被@时注入 + 周期注入）
-
-```
-【管理助手指令】
-你需要以群管理助手的身份协助维护群秩序。
-以下是当前群的上下文信息，请基于此做出管理判断:
-  当前群号: 123456789
-  你的身份: owner
-当发现违规行为时，请调用对应的管理工具处理。
-如有人询问群号等群信息，可从上下文直接获取回答。
-```
+> **v1.0 vs v1.1**：v1.0 用 `【角色】【职责】【处罚标准】` 等规章制度式 prompt，易被 LLM 的 persona prompt 压制。v1.1 改用参考指南式 prompt，开头即声明"保持你原本人设和说话风格"，强调"融入人设语气""做你自己"。
 
 ---
 
@@ -578,13 +586,14 @@ max_duration = 1800          # 首次就禁言30分钟
 
 ### Q: LLM 不响应管理请求（只会说"我不会"）
 
-**原因**：Bot 的人设优先级高于管理 prompt。
+**原因**：Bot 的人设优先级高于管理 prompt，v1.0 的规章制度式 prompt 尤其容易被忽略。
 
 **解决**：
 1. 确保 Bot 在群内是管理员/群主
 2. 检查 `auto_moderate.enabled = true`
-3. 被@时会注入群管理上下文和权限信息，普通消息依赖周期注入
-4. 如仍不行，调整 Bot 的系统人设 prompt，减少与管理指令的冲突
+3. **v1.1 已优化**：新 prompt 开头声明"保持你原本人设"，强调融入语气，与人设冲突大幅降低
+4. 开启 `logging.verbose_logging = true` 可在日志中看到每次注入的完整 prompt，确认是否到位
+5. 如仍不行，在 `auto_moderate_system` 中进一步定制与人设协调的措辞
 
 ### Q: `/mute @昵称` 提示"未找到成员"
 
@@ -626,7 +635,17 @@ max_duration = 1800          # 首次就禁言30分钟
 
 **原因**：`/admin reload` 只刷新内存配置，不重新注册组件。
 
-**解决**：代码修改、新增 Tool/Command 需要 WebUI 完整重载
+**解决**：代码修改、新增 Tool/Command/HookHandler 需要 WebUI 完整重载（禁用 → 启用）
+
+### Q: v1.1 升级后提示词注入没生效
+
+**原因**：v1.1 新增的 HookHandler 需要 WebUI 完整重载才能注册。
+
+**解决**：WebUI → 插件管理 → 禁用 → 启用。仅 `/admin reload` 不会注册新的 hook 点。
+
+### Q: 排查提示词是否注入到位
+
+**解决**：设置 `logging.verbose_logging = true`，然后 `/admin reload`，日志中将输出每次注入的完整 prompt 和守门动作。
 
 ### Q: 操作日志/计数器重启后丢失
 
@@ -645,7 +664,9 @@ max_duration = 1800          # 首次就禁言30分钟
 | `Tool-mute / Tool-kick / Tool-warn / ...` | LLM 调用管理 Tool |
 | `Cmd-status / Cmd-mute / Cmd-off / ...` | 管理员命令执行 |
 | `角色检测结果: group=... role=...` | Bot 身份识别 |
-| `注入管理 prompt: group=... mentioned=True` | 管理上下文注入 |
+| `注入管理 prompt: group=... role=...` | HookHandler 注入 extra_prompt（v1.1） |
+| `守门拦截: Bot(role=...)错误宣称无权限` | after_response 守门触发（v1.1） |
+| `守门改写回复: group=...` | 守门已替换回复内容（v1.1） |
 | `自动检查入群申请: groups={...}` | 自动审批扫描开始 |
 | `入群申请详情 / 入群申请决策` | 审批决策过程 |
 | `自动通过入群 / 自动拒绝入群` | 审批执行结果 |
@@ -659,6 +680,8 @@ max_duration = 1800          # 首次就禁言30分钟
 - **平台**：QQ（NapCat / MaiBot1.0-1.99）
 - **SDK**：MaiBot Plugin SDK v2
 - **适配器**：MaiBot-Napcat-Adapter
+- **提示词注入**：v1.1 采用 `HookHandler + extra_prompt`，每次 replyer 生成回复前注入；v1.0 的 `context.append` 通道已废弃
+- **守门**：`after_response` HookHandler 拦截 Bot 错误宣称无权限的回复
 - **并发安全**：`asyncio.Lock` 保护所有共享状态
 - **API 调用**：群管理核心操作使用 `_call_api`（直接 kwarg），系统消息/审批使用 `_call_action_api`（params 包装）
 - **依赖**：无额外第三方包
@@ -666,16 +689,41 @@ max_duration = 1800          # 首次就禁言30分钟
 
 ---
 
-## v1.0 功能总览
+## v1.1 功能总览
 
 | 模块 | 数量 | 详情 |
 |------|:---:|------|
 | 管理 Tool | 18 | warn / mute / unmute / kick / recall / essence_set / essence_unset / card / title / name / approve_join / reject_join / post_notice / delete_notice / get_member / get_shut_list / get_system_msg / get_notice |
 | 快捷命令 | 15 | /admin(status\|off\|on\|undo\|log\|ban\|unban\|reload) + /mute / /unmute / /kick / /warn / /essence / /recall / /shutlist |
+| HookHandler | 2 | before_request(注入) / after_response(守门) |
+| EventHandler | 1 | 追踪（群号映射/计数/角色缓存） |
 | 安全护栏 | 8 步 | protected_users → exempt_users → admins → auto_exempt → mute_cooldown → 每日限额 → kick_confirm → 处罚阶梯 |
-| 配置分区 | 9 | plugin / admin / identity / auto_moderate / safeguard / warning / escalation / auto_approve / logging / prompts |
+| 配置分区 | 10 | plugin / admin / identity / auto_moderate / safeguard / warning / escalation / auto_approve / logging / prompts |
 | 自动审批 | 支持 | 全局 + 按群独立覆盖（TOML 数组表），关键词过滤 + 每日限额 |
 | 警告系统 | 支持 | spam / abuse / ad 三类，可配阈值和计数窗口 |
 | 处罚阶梯 | 支持 | 按回溯小时数和操作次数自动升级 mute→kick |
 | 角色感知 | 支持 | 自动检测 Bot 在各群的 owner/admin/member 身份，注入对应权限描述 |
 | 并发安全 | asyncio.Lock | 所有 Tool 和后台任务共享一把锁 |
+
+---
+
+## 更新日志
+
+### v1.1.0 (2026-06-24)
+
+**优化部分**
+
+- 全面优化了插件提示词和提示词注入方式
+
+**Bug 修复**
+
+- 修复 `_check_daily_reset` 在跨日时将整个日计数字典覆写为单日条目，导致历史计数丢失的问题
+
+**清理**
+
+- 移除 `_manifest.json` 中已废弃的 `maisaka.context.append` capability（v1.1 已迁移到 HookHandler + extra_prompt）
+
+**文案优化**
+
+- `/admin status` 输出改为面板卡片风格，禁言/踢人计数不再显示为 `0/10` 进度条格式
+- `/admin log` 输出从管道分隔格式改为更紧凑的 `[时间] 状态 动作 @用户 -- 原因` 格式

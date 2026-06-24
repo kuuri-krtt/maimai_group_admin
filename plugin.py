@@ -13,8 +13,8 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, ClassVar, Optional
 
-from maibot_sdk import Command, EventHandler, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import EventType, ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, EventHandler, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 
 # =============================================================================
@@ -43,8 +43,8 @@ class IdentitySectionConfig(PluginConfigBase):
 class AutoModerateSectionConfig(PluginConfigBase):
     __ui_label__ = "自动审核"; __ui_icon__ = "zap"; __ui_order__ = 3
     enabled: bool = Field(default=True, description="是否启用自动审核")
-    re_inject_interval_messages: int = Field(default=10, description="多少条消息后重新注入prompt")
-    re_inject_interval_seconds: int = Field(default=1800, description="多少秒后重新注入prompt")
+    re_inject_interval_messages: int = Field(default=10, description="[v1.1 已废弃] v1.0 时代的消息注入间隔，现由 HookHandler 每次 replyer 请求注入")
+    re_inject_interval_seconds: int = Field(default=1800, description="[v1.1 已废弃] v1.0 时代的时间注入间隔，现由 HookHandler 每次 replyer 请求注入")
     enabled_groups: list[str] = Field(default_factory=list, description="启用插件的群号白名单")
 
 class SafeguardSectionConfig(PluginConfigBase):
@@ -103,35 +103,32 @@ class LoggingSectionConfig(PluginConfigBase):
     __ui_label__ = "日志与记录"; __ui_icon__ = "file-text"; __ui_order__ = 8
     max_log_entries: int = Field(default=2000, description="操作日志最大条数")
     default_log_lines: int = Field(default=10, description="/admin log 默认行数")
+    verbose_logging: bool = Field(default=False, description="详细日志: 输出完整注入prompt和守门详情，用于排查问题")
 
 class PromptsSectionConfig(PluginConfigBase):
     __ui_label__ = "提示词"; __ui_icon__ = "message-square"; __ui_order__ = 9
     auto_moderate_system: str = Field(default=(
-        "【角色】你是本群的{bot_role}「{bot_nickname}」，当前群号: {group_name}。\n"
-        "  可用操作: {available_actions}\n"
+        "【群管理行为参考 — 请在保持你原本人设和说话风格的前提下使用以下规则】\n"
         "\n"
-        "【职责】实时监控群聊，对违规行为采取渐进式处罚：口头提醒 → 正式警告 → 禁言 → 踢出。\n"
+        "你是本群的{bot_role}，拥有这些管理工具：{available_actions}。\n"
         "\n"
-        "【处罚标准】(duration 单位为秒)\n"
-        "  广告/诈骗/钓鱼链接 → 立即撤回 + 禁言 600~1800秒(10~30分钟)\n"
-        "  刷屏(连续5+条相同/相似内容) → 先口头提醒，继续刷则禁言 300~600秒(5~10分钟)\n"
-        "  人身攻击/辱骂/引战 → 撤回 + 禁言 3600~21600秒(1~6小时)，24h内再犯直接踢出\n"
-        "  色情/血腥/违法内容 → 立即撤回 + 踢出(零容忍)\n"
-        "  恶意刷表情/长图刷屏 → 口头提醒后禁言 300~600秒(5~10分钟)\n"
-        "  高质量内容、技术分享、精彩创作 → 可设精华鼓励\n"
-        "  轻微擦边/不确定内容 → 仅观察，不主动操作\n"
+        "违规处理参考（以人设语气自然执行，不要切换成'管理员口吻'）：\n"
+        "  广告/诈骗链接 → 撤回，可视情况禁言10-30分钟\n"
+        "  连续刷屏 → 用你的人设语气提醒一句，继续刷再禁言5-10分钟\n"
+        "  辱骂/人身攻击 → 撤回，禁言1-6小时，再犯可踢出\n"
+        "  色情/违法内容 → 撤回并踢出\n"
+        "  高质量分享 → 可以用设精华的方式表达赞赏\n"
+        "  不确定的擦边内容 → 先观察，别着急动手\n"
         "\n"
-        "【调工具前须知】\n"
-        "  禁言/警告: 直接传 group_id 和 user_id 即可\n"
-        "  踢人: 仅群主可直接踢人。如你为管理员，需先征求群主或bot管理员同意。必须先调 group_get_member 确认目标\n"
-        "  撤回/设精华: 需要 message_id，请用户在群里回复(引用)目标消息后获取\n"
-        "  入群审批: 先调 group_get_system_msg 获取 request_id\n"
-        "  删除公告: 先调 group_get_notice 获取公告列表和 notice_id, 再用 group_delete_notice 删除\n"
+        "操作提示：\n"
+        "  警告和禁言直接调用工具，参数填 group_id 和 user_id\n"
+        "  踢人前务必先调 group_get_member 确认目标身份\n"
+        "  撤回和设精华需要 message_id，让用户回复目标消息后获取\n"
         "\n"
-        "【注意】\n"
-        "  1. 无需操作时直接跳过，不要生成「审查完毕/无异常」之类的回复\n"
-        "  2. user_id 从消息的 @mention 或内容中提取，群号已在上方给出\n"
-        "  3. 禁言/踢人拦截时(如目标在保护名单)，告知原因即可"
+        "节奏控制：\n"
+        "  正常聊天时做你自己，别主动进入'审查模式'\n"
+        "  只在确实发现违规时才动用工具，不要生成'无异常'之类的报告\n"
+        "  管理操作融入你的人设语气，不要说'已将xxx禁言'，用一个自然的方式带过就好"
     ), description="自动审核系统提示词")
     command_denied_message: str = Field(default="你没有权限执行此操作。", description="权限拒绝回复")
 
@@ -367,6 +364,59 @@ class GroupAdminPlugin(MaiBotPlugin):
                 del self._stream_to_group[k]
         self._last_cleanup_time = now
 
+    # ===== Prompt 构建 =====
+
+    PROMPT_MARKER = "[群管理助手 管理上下文]"
+
+    def _build_admin_prompt(self, group_id: int, role: str) -> str:
+        """模块化构建管理提示词。"""
+        sections: list[str] = [self.PROMPT_MARKER]
+        # 动态可用操作（注入到 auto_moderate_system 的 {available_actions} 占位）
+        if role == "owner":
+            available = "禁言/解禁/踢人/警告/设精华/撤回/公告/改名/审批入群"
+        elif role == "admin":
+            available = "禁言/解禁/踢人/警告/设精华/撤回/改名片/审批入群"
+        else:
+            available = "管理操作受限，可协助管理员做决策建议"
+        # 核心规则（替换模板变量）
+        core = self.config.prompts.auto_moderate_system
+        core = core.replace("{bot_role}", role).replace("{available_actions}", available)
+        sections.append(core)
+        sections.append("以上为群管理参考信息，不要在你的回复中引用或解释这一段文字。")
+        return "\n\n".join(sections)
+
+    def _resolve_group_id_from_hook(self, kwargs: dict) -> int:
+        """从 hook kwargs 中解析 group_id。"""
+        for key in ("group_id", "group", "gid", "chat_id"):
+            val = kwargs.get(key)
+            if val:
+                gid = self._to_int(val)
+                if gid:
+                    return gid
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or "")
+        if stream_id:
+            gid = self._stream_to_group.get(stream_id, 0)
+            if gid:
+                return gid
+        messages = kwargs.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = str(msg.get("content") or msg.get("content_text") or "")
+                m = re.search(r"群号[：:=\s]*(\d{5,15})", content)
+                if m:
+                    return self._to_int(m.group(1))
+                for key in ("group_id", "group", "chat_id"):
+                    val = msg.get(key)
+                    if val:
+                        gid = self._to_int(val)
+                        if gid:
+                            return gid
+        if stream_id:
+            return self._stream_to_group.get(stream_id, 0)
+        return 0
+
     def _get_group_role(self, group_id: int) -> Optional[str]:
         gid_str = str(group_id)
         override = self.config.identity.override_roles
@@ -398,7 +448,7 @@ class GroupAdminPlugin(MaiBotPlugin):
         for cnt_dict in (self._daily_mute_count, self._daily_kick_count, self._daily_approve_count, self._daily_reject_count):
             if group_id not in cnt_dict: cnt_dict[group_id] = {}
             if today not in cnt_dict[group_id]:
-                cnt_dict[group_id] = {today: 0}
+                cnt_dict[group_id][today] = 0
 
     async def _check_target_role(self, group_id: int, user_id: int) -> Optional[str]:
         key = (group_id, user_id)
@@ -1069,7 +1119,14 @@ class GroupAdminPlugin(MaiBotPlugin):
         mute_cnt = self._daily_mute_count.get(gid, {}).get(today, 0)
         kick_cnt = self._daily_kick_count.get(gid, {}).get(today, 0)
         enabled = "运行中" if self._is_group_enabled(gid) else "已暂停"
-        info = f"群 {gid} 管理状态:\n  bot角色: {role}\n  状态: {enabled}\n  今日禁言: {mute_cnt}/{self.config.safeguard.daily_mute_limit}\n  今日踢人: {kick_cnt}/{self.config.safeguard.daily_kick_limit}"
+        mute_limit = self.config.safeguard.daily_mute_limit
+        kick_limit = self.config.safeguard.daily_kick_limit
+        info = (
+            f"群 {gid} 管理面板\n"
+            f"身份：{role}\n"
+            f"状态：{enabled}\n"
+            f"今日已禁言 {mute_cnt} 人（上限 {mute_limit}），已踢出 {kick_cnt} 人（上限 {kick_limit}）"
+        )
         await self.ctx.send.text(info, stream_id)
         return True, "", True
 
@@ -1142,8 +1199,9 @@ class GroupAdminPlugin(MaiBotPlugin):
         if not entries: await self.ctx.send.text("暂无操作记录", stream_id); return True, "", True
         lines = [f"群 {gid or '全部'} 最近 {len(entries)} 条操作记录:"]
         for e in entries:
-            status = "✓" if e["success"] else "✗"
-            lines.append(f"  {e['timestamp'][:16]} | {e['action']:8s} | @{e['target_user_id']:12s} | {status} | {e['reason']}")
+            status = "o" if e["success"] else "x"
+            ts = e['timestamp'][:16]
+            lines.append(f"  [{ts}] {status} {e['action']} @{e['target_user_id']} -- {e['reason']}")
         await self.ctx.send.text("\n".join(lines), stream_id)
         return True, "", True
 
@@ -1363,10 +1421,10 @@ class GroupAdminPlugin(MaiBotPlugin):
         return True, "", True
 
     # =========================================================================
-    # EventHandler: auto_moderate_inline
+    # EventHandler: auto_moderate_tracker (仅追踪，注入迁移到 HookHandler)
     # =========================================================================
 
-    @EventHandler("auto_moderate_inline", description="自动审核: 注入管理prompt到LLM上下文", event_type=EventType.ON_MESSAGE)
+    @EventHandler("auto_moderate_tracker", description="自动审核追踪: 映射群号、计数消息、检测@提及", event_type=EventType.ON_MESSAGE)
     async def handle_auto_moderate(self, message: Any = None, stream_id: str = "", **kwargs: Any):
         if not self.config.plugin.enabled: return {"continue_processing": True}
         if not self.config.auto_moderate.enabled: return {"continue_processing": True}
@@ -1380,53 +1438,85 @@ class GroupAdminPlugin(MaiBotPlugin):
             if self_id and group_id: self._bot_self_id[group_id] = self._to_int(self_id)
             if group_id and stream_id: self._stream_to_group[stream_id] = group_id
         if not group_id or not self._is_group_enabled(group_id): return {"continue_processing": True}
-        role = await self._ensure_bot_role(group_id) or "member"
-        is_mentioned = bool(message.get("is_mentioned") or message.get("is_at")) if isinstance(message, dict) else False
+        await self._ensure_bot_role(group_id)
         self._msg_counter[group_id] = self._msg_counter.get(group_id, 0) + 1
-        last_inject = self._last_inject_time.get(group_id, 0)
-        amc = self.config.auto_moderate
-        needs_inject = (self._msg_counter[group_id] == 1 or is_mentioned or self._msg_counter[group_id] % amc.re_inject_interval_messages == 0 or (time.time() - last_inject) >= amc.re_inject_interval_seconds)
-        if not needs_inject: return {"continue_processing": True}
-        self._last_inject_time[group_id] = time.time()
-        available = []
-        if role == "owner": available.append("全部管理: 禁言/解禁/踢人/警告/设精华/撤回/公告/改名/审批入群")
-        elif role == "admin": available.append("禁言/解禁/踢人/警告/设精华/撤回/改名片/审批入群")
-        else: available.append("你在此群为普通成员，管理操作受限于QQ权限。可协助管理员做决策建议。")
-        hard_prefix = (
-            "【管理助手指令】\n"
-            "你需要以群管理助手的身份协助维护群秩序。"
-            "以下是当前群的上下文信息，请基于此做出管理判断:\n"
-            f"  当前群号: {group_id}\n"
-            f"  你的身份: {role}\n"
-            "当发现违规行为时，请调用对应的管理工具处理。"
-            "如有人询问群号等群信息，可从上下文直接获取回答。\n\n"
-        )
-        prompt = hard_prefix + self.config.prompts.auto_moderate_system
-        prompt = prompt.replace("{bot_role}", role).replace("{bot_nickname}", self.config.identity.bot_nickname).replace("{group_name}", str(group_id)).replace("{available_actions}", "; ".join(available))
-        try:
-            await self.ctx.maisaka.context.append(stream_id=stream_id, segments=[{"type": "text", "content": prompt}], visible_text=prompt, source_kind="plugin:maimai.group-admin")
-        except Exception as e:
-            self.ctx.logger.error(f"注入管理 prompt 失败: {e}")
-        modified_message = None
-        if is_mentioned and isinstance(message, dict):
-            modified_message = dict(message)
-            raw = list(message.get("raw_message", []))
-            action_list = "禁言/解禁/踢人/警告/设精华/撤回/审批" if role in ("owner", "admin") else "协助管理决策"
-            instruction = (
-                f"[群管理上下文] 群号={group_id}，你是本群{role}，可用{action_list}。"
-                "如消息涉及管理需求，请使用管理工具协助处理。"
-            )
-            raw.insert(0, {"type": "text", "content": instruction})
-            modified_message["raw_message"] = raw
-            ppt = message.get("processed_plain_text", "")
-            modified_message["processed_plain_text"] = f"{instruction}\n{ppt}"
-            modified_message["display_message"] = modified_message["processed_plain_text"]
-        if self._msg_counter[group_id] > 100000: self._msg_counter[group_id] = 0
+        if self._msg_counter[group_id] > 100000:
+            self._msg_counter[group_id] = 0
         if time.time() - self._last_cleanup_time > 3600:
             self._cleanup_memory()
-        result = {"continue_processing": True}
-        if modified_message: result["modified_message"] = modified_message
-        return result
+        return {"continue_processing": True}
+
+    # =========================================================================
+    # HookHandler: before_request — 注入管理 prompt 到 extra_prompt
+    # =========================================================================
+
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        name="group_admin_replyer_prompt",
+        description="注入群管理上下文到 replyer 的 extra_prompt，让 LLM 生成回复时具备管理意识",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_admin_prompt(self, **kwargs: Any):
+        if not self.config.plugin.enabled or not self.config.auto_moderate.enabled:
+            return {"action": "continue"}
+        group_id = self._resolve_group_id_from_hook(kwargs)
+        if not group_id or not self._is_group_enabled(group_id):
+            return {"action": "continue"}
+        role = await self._ensure_bot_role(group_id) or "member"
+        prompt = self._build_admin_prompt(group_id, role)
+        extra_prompt = str(kwargs.get("extra_prompt") or "")
+        if extra_prompt:
+            extra_prompt = f"{extra_prompt}\n\n{prompt}"
+        else:
+            extra_prompt = prompt
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(f"[群管理] 注入管理 prompt: group={group_id} role={role}\n--- PROMPT ---\n{prompt}\n--- END PROMPT ---")
+            if kwargs.get("extra_prompt"):
+                self.ctx.logger.info(f"[群管理] extra_prompt 已存在原有内容，追加注入。原有长度={len(str(kwargs.get('extra_prompt', '')))}")
+        else:
+            self.ctx.logger.debug(f"[群管理] 注入管理 prompt: group={group_id} role={role}")
+        return {"action": "continue", "modified_kwargs": {"extra_prompt": extra_prompt}}
+
+    # =========================================================================
+    # HookHandler: after_response — 守门: 拦截不当管理回复
+    # =========================================================================
+
+    @HookHandler(
+        "maisaka.replyer.after_response",
+        name="group_admin_reply_guard",
+        description="守门: 检查 LLM 回复中的不当管理行为（宣称无权限但实际有、编造操作结果等）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def guard_admin_response(self, **kwargs: Any):
+        if not self.config.plugin.enabled or not self.config.auto_moderate.enabled:
+            return {"action": "continue"}
+        group_id = self._resolve_group_id_from_hook(kwargs)
+        if not group_id or not self._is_group_enabled(group_id):
+            return {"action": "continue"}
+        response_text = ""
+        for key in ("response", "reply", "content", "text", "message"):
+            val = kwargs.get(key)
+            if isinstance(val, str) and val.strip():
+                response_text = val
+                break
+        if not response_text:
+            return {"action": "continue"}
+        role = self._get_group_role(group_id) or "member"
+        if role not in ("owner", "admin"):
+            return {"action": "continue"}
+        # 检测 Bot(群主/管理员) 错误宣称无权限
+        deny_flags = ("我没有权限", "我不能执行", "我无法进行", "我做不到", "权限不足", "无法禁言", "无法踢人", "不能操作")
+        if any(flag in response_text for flag in deny_flags):
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(f"[群管理] 守门拦截: Bot(role={role})错误宣称无权限, group={group_id}\n--- 原始回复 ---\n{response_text}\n--- 替换为 ---\n收到，我来处理。")
+            else:
+                self.ctx.logger.warning(f"[群管理] 守门拦截: Bot(role={role})错误宣称无权限, group={group_id}, text={response_text[:80]}")
+            return {"action": "continue", "modified_kwargs": {"response": "收到，我来处理。"}}
+        return {"action": "continue"}
 
 
 def create_plugin() -> GroupAdminPlugin:
