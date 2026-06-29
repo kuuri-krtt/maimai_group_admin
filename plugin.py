@@ -1,12 +1,11 @@
-"""群管理助手 — LLM 自主管理 QQ 群插件。v1.4
+"""群管理助手 — LLM 自主管理 QQ 群插件。v1.5
 
 18 个管理 Tool + 15 条快捷命令 + 4 个 HookHandler，支持禁言/解禁/踢人/警告/设精华/撤回/改名片/
 改头衔/改群名/公告发布与删除/入群审批，含 8 步安全护栏 + 按群独立配置。
 
-v1.4: 新增 chat.receive.after_process HookHandler 缓存 session_id→group_id 映射，修复双路注入
-跨群角色污染问题。before_model_request 按群精确注入，每个群获取真实 bot 角色，未启用群和私聊
-不注入。同时修复 _ensure_bot_role 跨群 self_id fallback、_check_admin_permission group_id=0 误判、
-_get_member_called TTL 缺失、_resolve_group_id_from_hook 过度猜测等 8 个安全漏洞。
+v1.5: 全面修复三大类缺陷 — 缓存生命周期(TTL + 独立清理任务)、跨群统计隔离(_warnings/_escalation/_bot_self_id)、
+内存清理策略(_last_mute_time/_get_member_called/_known_roles 按时淘汰)、竞态条件加锁、异常处理统一、
+/admin reload 清空运行时缓存、auto_approve.groups 按群覆盖修复，共 27 处异常风格统一。
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder, ToolPa
 class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件开关"; __ui_icon__ = "power"; __ui_order__ = 0
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.4.0", description="配置版本")
+    config_version: str = Field(default="1.5.0", description="配置版本")
 
 class AdminSectionConfig(PluginConfigBase):
     __ui_label__ = "管理员权限"; __ui_icon__ = "shield"; __ui_order__ = 1
@@ -154,21 +153,21 @@ class GroupAdminPlugin(MaiBotPlugin):
         super().__init__()
         self._group_roles: dict[int, str] = {}
         self._role_refresh_time: dict[int, float] = {}
-        self._known_roles: dict[tuple[int, int], str] = {}
-        self._bot_self_id: dict[int, int] = {}
+        self._known_roles: dict[tuple[int, int], tuple[str, float]] = {}
+        self._bot_self_id: Optional[int] = None
         self._stream_to_group: dict[str, int] = {}
         self._disabled_groups: set[int] = set()
-        self._msg_counter: dict[int, int] = {}
         self._daily_mute_count: dict[int, dict[str, int]] = {}
         self._daily_kick_count: dict[int, dict[str, int]] = {}
         self._daily_approve_count: dict[int, dict[str, int]] = {}
         self._daily_reject_count: dict[int, dict[str, int]] = {}
-        self._warnings: dict[int, dict[str, list[tuple[float, int]]]] = {}
+        self._warnings: dict[int, dict[int, dict[str, list[tuple[float, int]]]]] = {}
         self._op_log: deque[dict[str, Any]] = deque(maxlen=5000)
         self._get_member_called: dict[int, dict[int, float]] = {}
         self._last_mute_time: dict[tuple[int, int], float] = {}
         self._lock: asyncio.Lock = asyncio.Lock()
         self._auto_check_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._last_cleanup_time: float = 0
 
     # ===== 生命周期 =====
@@ -178,15 +177,19 @@ class GroupAdminPlugin(MaiBotPlugin):
             return
         self._ensure_op_log_capacity()
         self._start_auto_check()
+        self._start_cleanup()
 
     async def on_unload(self) -> None:
         self._stop_auto_check()
+        self._stop_cleanup()
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != "self":
             return
         self.set_plugin_config(config_data)
         self._ensure_op_log_capacity()
+        self._stop_auto_check()
+        self._start_auto_check()
         if version:
             self.ctx.logger.debug(f"群管理插件配置更新: {version}")
 
@@ -212,6 +215,26 @@ class GroupAdminPlugin(MaiBotPlugin):
             self._auto_check_task.cancel()
         self._auto_check_task = None
 
+    def _start_cleanup(self):
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    def _stop_cleanup(self):
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+        self._cleanup_task = None
+
+    async def _cleanup_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(600)
+                self._cleanup_memory()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.ctx.logger.error("[群管理] 清理循环异常", exc_info=True)
+
     async def _auto_check_loop(self, interval: int):
         while True:
             try:
@@ -220,20 +243,26 @@ class GroupAdminPlugin(MaiBotPlugin):
                 self._cleanup_memory()
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                self.ctx.logger.error(f"[群管理] 自动检查异常: {e}")
+            except Exception:
+                self.ctx.logger.error("[群管理] 自动检查异常", exc_info=True)
 
     async def _check_join_requests(self):
         aa = self.config.auto_approve
         am_enabled = self.config.auto_moderate.enabled_groups
         known_groups = {int(g) for g in am_enabled if g}
+        aa_only_groups: set[int] = set()
+        for g in aa.groups:
+            gid = self._to_int(g.group_id)
+            if gid > 0 and gid not in known_groups:
+                aa_only_groups.add(gid)
+                known_groups.add(gid)
         if not known_groups:
             return
         self.ctx.logger.info(f"[群管理] 自动检查入群申请: groups={known_groups}")
         now = datetime.now()
         max_age = aa.max_pending_seconds
         for gid in known_groups:
-            if not self._is_group_enabled(gid):
+            if gid not in aa_only_groups and not self._is_group_enabled(gid):
                 continue
             grp_enabled, grp_default = self._get_aa_enabled_action(gid)
             if not grp_enabled or grp_default == "ignore":
@@ -283,28 +312,38 @@ class GroupAdminPlugin(MaiBotPlugin):
                         action = "ignore"
                     self.ctx.logger.info(f"[群管理] 入群申请决策: gid={req_gid} req={request_id} action={action}")
                     if action == "approve":
-                        await self._check_daily_reset(req_gid)
-                        today = self._today_key()
-                        self._daily_approve_count.setdefault(req_gid, {}).setdefault(today, 0)
-                        if self._daily_approve_count[req_gid][today] >= appr_lim:
+                        is_protected, protect_msg = await self._is_protected(req_gid, self._to_int(user_id))
+                        if is_protected:
+                            self.ctx.logger.info(f"[群管理] 入群申请跳过(受保护): gid={req_gid} user={user_id}: {protect_msg}")
                             continue
-                        ok2, _ = await self._call_action_api(api_name="adapter.napcat.group.set_group_add_request", group_id=req_gid, flag=request_id, approve=True)
-                        if ok2:
-                            self._daily_approve_count[req_gid][today] += 1
-                            self._add_log(req_gid, "approve", self._to_int(user_id), "自动通过", True)
-                            self.ctx.logger.info(f"[群管理] 自动通过入群: gid={req_gid} user={user_id}")
+                        async with self._lock:
+                            await self._check_daily_reset(req_gid)
+                            today = self._today_key()
+                            self._daily_approve_count.setdefault(req_gid, {}).setdefault(today, 0)
+                            if self._daily_approve_count[req_gid][today] >= appr_lim:
+                                continue
+                            ok2, _ = await self._call_action_api(api_name="adapter.napcat.group.set_group_add_request", group_id=req_gid, flag=request_id, approve=True)
+                            if ok2:
+                                self._daily_approve_count[req_gid][today] += 1
+                                self._add_log(req_gid, "approve", self._to_int(user_id), "自动通过", True)
+                                self.ctx.logger.info(f"[群管理] 自动通过入群: gid={req_gid} user={user_id}")
                     elif action == "reject":
-                        await self._check_daily_reset(req_gid)
-                        today = self._today_key()
-                        self._daily_reject_count.setdefault(req_gid, {}).setdefault(today, 0)
-                        if self._daily_reject_count[req_gid][today] >= rej_lim:
+                        is_protected, protect_msg = await self._is_protected(req_gid, self._to_int(user_id))
+                        if is_protected:
+                            self.ctx.logger.info(f"[群管理] 入群申请跳过(受保护): gid={req_gid} user={user_id}: {protect_msg}")
                             continue
-                        reason = "含拒绝关键词" if reject_match else "自动拒绝"
-                        ok2, _ = await self._call_action_api(api_name="adapter.napcat.group.set_group_add_request", group_id=req_gid, flag=request_id, approve=False, reason=reason)
-                        if ok2:
-                            self._daily_reject_count[req_gid][today] += 1
-                            self._add_log(req_gid, "reject", self._to_int(user_id), reason, True)
-                            self.ctx.logger.info(f"[群管理] 自动拒绝入群: gid={req_gid} user={user_id}")
+                        async with self._lock:
+                            await self._check_daily_reset(req_gid)
+                            today = self._today_key()
+                            self._daily_reject_count.setdefault(req_gid, {}).setdefault(today, 0)
+                            if self._daily_reject_count[req_gid][today] >= rej_lim:
+                                continue
+                            reason = "含拒绝关键词" if reject_match else "自动拒绝"
+                            ok2, _ = await self._call_action_api(api_name="adapter.napcat.group.set_group_add_request", group_id=req_gid, flag=request_id, approve=False, reason=reason)
+                            if ok2:
+                                self._daily_reject_count[req_gid][today] += 1
+                                self._add_log(req_gid, "reject", self._to_int(user_id), reason, True)
+                                self.ctx.logger.info(f"[群管理] 自动拒绝入群: gid={req_gid} user={user_id}")
 
     # ===== 辅助方法 =====
 
@@ -332,7 +371,7 @@ class GroupAdminPlugin(MaiBotPlugin):
             self._op_log = deque(self._op_log, maxlen=maxlen)
 
     def _cleanup_memory(self):
-        """清理过期内存数据：warnings 过期条目、known_roles/stream_to_group 上限裁剪。"""
+        """清理过期内存数据：warnings 过期条目、known_roles/stream_to_group 上限裁剪、last_mute_time/get_member_called 旧条目。"""
         now = time.time()
         max_warn_window = max(
             self.config.warning.spam_warn_window,
@@ -341,24 +380,41 @@ class GroupAdminPlugin(MaiBotPlugin):
             3600,
         )
         keep_seconds = max_warn_window * 2
-        for uid in list(self._warnings.keys()):
-            for vtype in list(self._warnings[uid].keys()):
-                self._warnings[uid][vtype] = [
-                    (ts, c) for ts, c in self._warnings[uid][vtype]
-                    if now - ts <= keep_seconds
-                ]
-                if not self._warnings[uid][vtype]:
-                    del self._warnings[uid][vtype]
-            if not self._warnings[uid]:
-                del self._warnings[uid]
+        for gid in list(self._warnings.keys()):
+            for uid in list(self._warnings[gid].keys()):
+                for vtype in list(self._warnings[gid][uid].keys()):
+                    self._warnings[gid][uid][vtype] = [
+                        (ts, c) for ts, c in self._warnings[gid][uid][vtype]
+                        if now - ts <= keep_seconds
+                    ]
+                    if not self._warnings[gid][uid][vtype]:
+                        del self._warnings[gid][uid][vtype]
+                if not self._warnings[gid][uid]:
+                    del self._warnings[gid][uid]
+            if not self._warnings[gid]:
+                del self._warnings[gid]
+        known_ttl = 3600
+        for k in list(self._known_roles.keys()):
+            if now - self._known_roles[k][1] > known_ttl:
+                del self._known_roles[k]
         if len(self._known_roles) > 2000:
-            keys = list(self._known_roles.keys())
-            for k in keys[:-1000]:
+            keys = sorted(self._known_roles.keys(), key=lambda k: self._known_roles[k][1])
+            for k in keys[:len(keys) - 1000]:
                 del self._known_roles[k]
         if len(self._stream_to_group) > 1000:
             keys = list(self._stream_to_group.keys())
             for k in keys[:-500]:
                 del self._stream_to_group[k]
+        mute_cooldown_max = max(self.config.safeguard.mute_cooldown, 300) * 3
+        for k in list(self._last_mute_time.keys()):
+            if now - self._last_mute_time[k] > mute_cooldown_max:
+                del self._last_mute_time[k]
+        for gid in list(self._get_member_called.keys()):
+            for uid in list(self._get_member_called[gid].keys()):
+                if now - self._get_member_called[gid][uid] > 300:
+                    del self._get_member_called[gid][uid]
+            if not self._get_member_called[gid]:
+                del self._get_member_called[gid]
         self._last_cleanup_time = now
 
     # ===== Prompt 构建 =====
@@ -423,6 +479,7 @@ class GroupAdminPlugin(MaiBotPlugin):
             result = await self.ctx.api.call(api_name=api_name, version="1", **api_args)
             return True, result
         except Exception as e:
+            self.ctx.logger.warning(f"[群管理] API调用失败: {api_name}: {e}")
             return False, str(e)
 
     async def _call_action_api(self, api_name: str, **params: Any) -> tuple[bool, Any]:
@@ -430,26 +487,33 @@ class GroupAdminPlugin(MaiBotPlugin):
             result = await self.ctx.api.call(api_name=api_name, version="1", params=params)
             return True, result
         except Exception as e:
+            self.ctx.logger.warning(f"[群管理] API调用失败: {api_name}: {e}")
             return False, str(e)
 
     async def _check_daily_reset(self, group_id: int):
         today = self._today_key()
         for cnt_dict in (self._daily_mute_count, self._daily_kick_count, self._daily_approve_count, self._daily_reject_count):
             if group_id not in cnt_dict: cnt_dict[group_id] = {}
+            for old_day in list(cnt_dict[group_id].keys()):
+                if old_day != today:
+                    del cnt_dict[group_id][old_day]
             if today not in cnt_dict[group_id]:
                 cnt_dict[group_id][today] = 0
 
     async def _check_target_role(self, group_id: int, user_id: int) -> Optional[str]:
         key = (group_id, user_id)
-        if key in self._known_roles: return self._known_roles[key]
+        if key in self._known_roles:
+            role, ts = self._known_roles[key]
+            if time.time() - ts < 3600:
+                return role
         try:
             ok, data = await self._call_api(api_name="adapter.napcat.group.get_group_member_info", group_id=group_id, user_id=user_id, no_cache=True)
             if ok and isinstance(data, dict):
                 role = data.get("role", "")
-                self._known_roles[key] = role
+                self._known_roles[key] = (role, time.time())
                 return role
         except Exception as e:
-            self.ctx.logger.warning(f"查询用户身份失败: {e}")
+            self.ctx.logger.warning(f"[群管理] 查询用户身份失败: {e}")
         return None
 
     async def _is_protected(self, group_id: int, user_id: int) -> tuple[bool, str]:
@@ -477,7 +541,7 @@ class GroupAdminPlugin(MaiBotPlugin):
                 if self.config.identity.bot_qq and self.config.identity.bot_qq.strip():
                     self_id = self._to_int(self.config.identity.bot_qq)
                 if not self_id:
-                    self_id = self._bot_self_id.get(group_id)
+                    self_id = self._bot_self_id
                 if not self_id:
                     return None
                 ok, data = await self._call_api(api_name="adapter.napcat.group.get_group_member_info", group_id=group_id, user_id=self_id, no_cache=True)
@@ -492,6 +556,7 @@ class GroupAdminPlugin(MaiBotPlugin):
                     self._role_refresh_time[group_id] = time.time()
                     return "member"
             except Exception as e:
+                self.ctx.logger.warning(f"[群管理] Bot角色检测失败: group={group_id}: {e}")
                 self._group_roles[group_id] = "member"
                 self._role_refresh_time[group_id] = time.time()
                 return "member"
@@ -531,26 +596,26 @@ class GroupAdminPlugin(MaiBotPlugin):
     def _add_log(self, group_id: int, action: str, target_user_id: int, reason: str, success: bool):
         self._op_log.append({"timestamp": datetime.now().isoformat(), "group_id": group_id, "action": action, "target_user_id": target_user_id, "reason": reason, "success": success})
 
-    def _count_ops_in_window(self, user_id: int, window_hours: float) -> int:
+    def _count_ops_in_window(self, group_id: int, user_id: int, window_hours: float) -> int:
         cutoff = datetime.now() - timedelta(hours=window_hours)
-        return sum(1 for e in self._op_log if e["target_user_id"] == user_id and e["action"] in ("warn", "mute", "kick") and datetime.fromisoformat(e["timestamp"]) > cutoff)
+        return sum(1 for e in self._op_log if e["group_id"] == group_id and e["target_user_id"] == user_id and e["action"] in ("warn", "mute", "kick") and datetime.fromisoformat(e["timestamp"]) > cutoff)
 
-    def _check_escalation(self, user_id: int) -> Optional[EscalationStepConfig]:
+    def _check_escalation(self, group_id: int, user_id: int) -> Optional[EscalationStepConfig]:
         if not self.config.escalation.enabled: return None
         steps = self.config.escalation.escalation_steps
         if not steps: return None
         for step in steps:
-            if self._count_ops_in_window(user_id, float(step.within_hours)) >= int(step.count):
+            if self._count_ops_in_window(group_id, user_id, float(step.within_hours)) >= int(step.count):
                 return step
         return None
 
-    def _check_warning_threshold(self, user_id: int, violation_type: str) -> tuple[bool, int, int]:
+    def _check_warning_threshold(self, group_id: int, user_id: int, violation_type: str) -> tuple[bool, int, int]:
         wc = self.config.warning
         if not wc.enabled: return False, 0, 999
         thresholds = {"spam": (wc.spam_warn_threshold, wc.spam_warn_window), "abuse": (wc.abuse_warn_threshold, wc.abuse_warn_window), "ad": (wc.ad_warn_threshold, wc.ad_warn_window)}
         threshold, window = thresholds.get(violation_type, (3, 600))
         if threshold <= 0: return True, 0, 0
-        user_w = self._warnings.get(user_id, {}).get(violation_type, [])
+        user_w = self._warnings.get(group_id, {}).get(user_id, {}).get(violation_type, [])
         now = time.time()
         user_w = [(ts, c) for ts, c in user_w if now - ts <= window]
         count = sum(c for _, c in user_w)
@@ -604,7 +669,8 @@ class GroupAdminPlugin(MaiBotPlugin):
                     uid = str(m.get("user_id", ""))
                     if target.lower() in (nick.lower(), card.lower()):
                         return self._to_int(uid)
-        except Exception: pass
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] 通过昵称查找成员失败: group={gid} target={target}: {e}")
         await self.ctx.send.text(f"未找到成员: {target} (请使用QQ号)", stream_id)
         return 0
 
@@ -666,6 +732,7 @@ class GroupAdminPlugin(MaiBotPlugin):
         ToolParameterInfo(name="reason", param_type=ToolParamType.STRING, description="警告原因(简要说明违规内容)", required=True),
     ])
     async def tool_warn_user(self, group_id: int = 0, user_id: int = 0, violation_type: str = "", reason: str = "", **kwargs: Any) -> dict[str, Any]:
+        stream_id = str(kwargs.get("stream_id", ""))
         del kwargs
         if group_id <= 0:
             return {"name": "group_warn_user", "content": "无效的 group_id"}
@@ -674,11 +741,11 @@ class GroupAdminPlugin(MaiBotPlugin):
             await self._check_daily_reset(group_id)
             is_protected, msg = await self._is_protected(group_id, user_id)
             if is_protected: return {"name": "group_warn_user", "content": f"无法警告: {msg}"}
-            self._warnings.setdefault(user_id, {}).setdefault(violation_type, []).append((time.time(), 1))
+            self._warnings.setdefault(group_id, {}).setdefault(user_id, {}).setdefault(violation_type, []).append((time.time(), 1))
             type_cn = {"spam": "刷屏", "abuse": "辱骂", "ad": "广告"}.get(violation_type, violation_type)
             warn_text = f"⚠ 提醒: {reason}"
-            await self.ctx.send.text(warn_text, str(group_id))
-            over, current, thresh = self._check_warning_threshold(user_id, violation_type)
+            await self.ctx.send.text(warn_text, stream_id if stream_id else str(group_id))
+            over, current, thresh = self._check_warning_threshold(group_id, user_id, violation_type)
             self._add_log(group_id, "warn", user_id, reason, True)
             extra = f"\n该用户 {type_cn} 类提醒已达 {current}/{thresh}，请注意是否需要升级处理。" if over else ""
             return {"name": "group_warn_user", "content": f"已向 {user_id} 发出正式提醒（{type_cn}），原因：{reason}{extra}"}
@@ -712,7 +779,7 @@ class GroupAdminPlugin(MaiBotPlugin):
             if sf.mute_cooldown > 0 and (time.time() - last_mute) < sf.mute_cooldown:
                 remain = int(sf.mute_cooldown - (time.time() - last_mute))
                 return {"name": "group_mute_user", "content": f"该用户 {remain} 秒前刚被禁言过，冷却中（至少间隔 {sf.mute_cooldown} 秒）"}
-            esc = self._check_escalation(user_id)
+            esc = self._check_escalation(group_id, user_id)
             if esc and esc.action == "mute": duration = min(duration, esc.max_duration)
             if esc and esc.action == "kick": return {"name": "group_mute_user", "content": "该用户已达处罚阶梯要求，应踢出而非禁言，请使用 group_kick_user"}
             try:
@@ -725,9 +792,10 @@ class GroupAdminPlugin(MaiBotPlugin):
                 dur_str = f"{dur_min}分钟" if dur_min > 0 else f"{duration}秒"
                 tip = "（已按阶梯规则调整时长）" if esc else ""
                 return {"name": "group_mute_user", "content": f"已将 @{user_id} 禁言 {dur_str}，原因：{reason}{tip}"}
-            except Exception as e:
+            except Exception:
                 self._add_log(group_id, "mute", user_id, reason, False)
-                return {"name": "group_mute_user", "content": f"禁言未能生效: {e}"}
+                self.ctx.logger.error(f"[群管理] Tool-mute 异常: group={group_id} user={user_id}", exc_info=True)
+                return {"name": "group_mute_user", "content": "禁言未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_unmute_user
@@ -747,8 +815,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=self._to_int(group_id), user_id=self._to_int(user_id), duration=0)
                 if not ok: return {"name": "group_unmute_user", "content": f"解除禁言未能生效: {data}"}
                 return {"name": "group_unmute_user", "content": f"已解除 @{user_id} 的禁言"}
-            except Exception as e:
-                return {"name": "group_unmute_user", "content": f"解除禁言未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-unmute 异常: group={group_id} user={user_id}", exc_info=True)
+                return {"name": "group_unmute_user", "content": "解除禁言未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_kick_user
@@ -773,7 +842,7 @@ class GroupAdminPlugin(MaiBotPlugin):
                 return {"name": "group_kick_user", "content": "权限不足，仅群主可以踢人"}
             is_protected, msg = await self._is_protected(group_id, user_id)
             if is_protected: return {"name": "group_kick_user", "content": f"无法踢出: {msg}"}
-            esc = self._check_escalation(user_id)
+            esc = self._check_escalation(group_id, user_id)
             if esc and esc.action == "mute":
                 return {"name": "group_kick_user", "content": f"处罚阶梯建议先禁言 {esc.max_duration} 秒而非直接踢出，请使用 group_mute_user"}
             sf = self.config.safeguard
@@ -791,9 +860,10 @@ class GroupAdminPlugin(MaiBotPlugin):
                 self._add_log(group_id, "kick", user_id, reason, True)
                 self._get_member_called[group_id].pop(user_id, None)
                 return {"name": "group_kick_user", "content": f"已将 @{user_id} 踢出群聊，原因：{reason}"}
-            except Exception as e:
+            except Exception:
                 self._add_log(group_id, "kick", user_id, reason, False)
-                return {"name": "group_kick_user", "content": f"踢出未能生效: {e}"}
+                self.ctx.logger.error(f"[群管理] Tool-kick 异常: group={group_id} user={user_id}", exc_info=True)
+                return {"name": "group_kick_user", "content": "踢出未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_set_user_card
@@ -816,8 +886,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.set_group_card", group_id=self._to_int(group_id), user_id=self._to_int(user_id), card=card)
                 if not ok: return {"name": "group_set_user_card", "content": f"修改群名片未能生效: {data}"}
                 return {"name": "group_set_user_card", "content": f"已将 @{user_id} 的群名片改为「{card}」"}
-            except Exception as e:
-                return {"name": "group_set_user_card", "content": f"修改群名片未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-card 异常: group={group_id} user={user_id}", exc_info=True)
+                return {"name": "group_set_user_card", "content": "修改群名片未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_set_title
@@ -840,8 +911,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.set_group_special_title", group_id=self._to_int(group_id), user_id=self._to_int(user_id), special_title=title)
                 if not ok: return {"name": "group_set_title", "content": f"设置头衔未能生效: {data}"}
                 return {"name": "group_set_title", "content": f"已将 @{user_id} 的专属头衔设为「{title}」"}
-            except Exception as e:
-                return {"name": "group_set_title", "content": f"设置头衔未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-title 异常: group={group_id} user={user_id}", exc_info=True)
+                return {"name": "group_set_title", "content": "设置头衔未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_set_name
@@ -861,8 +933,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_api(api_name="adapter.napcat.group.set_group_name", group_id=self._to_int(group_id), group_name=name)
                 if not ok: return {"name": "group_set_name", "content": f"修改群名未能生效: {data}"}
                 return {"name": "group_set_name", "content": f"已将群名改为「{name}」"}
-            except Exception as e:
-                return {"name": "group_set_name", "content": f"修改群名失败: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-setname 异常: group={group_id}", exc_info=True)
+                return {"name": "group_set_name", "content": "修改群名未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_approve_join
@@ -889,8 +962,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 if not ok: return {"name": "group_approve_join", "content": f"通过申请未能生效: {data}"}
                 self._daily_approve_count[group_id][today] += 1
                 return {"name": "group_approve_join", "content": f"已通过入群申请 {request_id}"}
-            except Exception as e:
-                return {"name": "group_approve_join", "content": f"通过申请失败: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-approve 异常: group={group_id}", exc_info=True)
+                return {"name": "group_approve_join", "content": "通过申请未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_reject_join
@@ -917,8 +991,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 if not ok: return {"name": "group_reject_join", "content": f"拒绝申请未能生效: {data}"}
                 self._daily_reject_count[group_id][today] += 1
                 return {"name": "group_reject_join", "content": f"已拒绝入群申请 {request_id}: {reason}"}
-            except Exception as e:
-                return {"name": "group_reject_join", "content": f"拒绝申请失败: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-reject 异常: group={group_id}", exc_info=True)
+                return {"name": "group_reject_join", "content": "拒绝申请未能生效，请稍后重试"}
 
     # =========================================================================
     # Tool: group_post_notice / group_delete_notice / group_set_essence / group_unset_essence / group_recall_msg / group_get_member / group_get_shut_list / group_get_system_msg
@@ -946,8 +1021,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 else:
                     result += f"，返回数据: {data}"
                 return {"name": "group_post_notice", "content": result}
-            except Exception as e:
-                return {"name": "group_post_notice", "content": f"发布公告失败: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-notice-post 异常: group={group_id}", exc_info=True)
+                return {"name": "group_post_notice", "content": "发布公告未能生效，请稍后重试"}
 
     @Tool("group_delete_notice", description="删除群公告 (仅群主). 先用 group_get_notice 获取公告列表和 notice_id", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -963,8 +1039,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.delete_group_notice", group_id=self._to_int(group_id), notice_id=notice_id)
                 if not ok: return {"name": "group_delete_notice", "content": f"删除公告未能生效: {data}"}
                 return {"name": "group_delete_notice", "content": f"已删除公告 {notice_id}"}
-            except Exception as e:
-                return {"name": "group_delete_notice", "content": f"删除公告未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-notice-del 异常: group={group_id}", exc_info=True)
+                return {"name": "group_delete_notice", "content": "删除公告未能生效，请稍后重试"}
 
     @Tool("group_set_essence", description="将消息设为群精华。操作流程: 先在群里请用户回复(引用)目标消息, 用户回复后从回复中提取 message_id 调用本工具", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -980,8 +1057,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.set_essence_msg", group_id=self._to_int(group_id), message_id=message_id)
                 if not ok: return {"name": "group_set_essence", "content": f"设为精华未能生效: {data}"}
                 return {"name": "group_set_essence", "content": f"已将消息 {message_id} 设为精华"}
-            except Exception as e:
-                return {"name": "group_set_essence", "content": f"设为精华未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-essence-set 异常: group={group_id}", exc_info=True)
+                return {"name": "group_set_essence", "content": "设为精华未能生效，请稍后重试"}
 
     @Tool("group_unset_essence", description="取消消息的精华状态。操作流程同 group_set_essence", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -997,8 +1075,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.delete_essence_msg", group_id=self._to_int(group_id), message_id=message_id)
                 if not ok: return {"name": "group_unset_essence", "content": f"取消精华未能生效: {data}"}
                 return {"name": "group_unset_essence", "content": f"已取消消息 {message_id} 的精华"}
-            except Exception as e:
-                return {"name": "group_unset_essence", "content": f"取消精华未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-essence-del 异常: group={group_id}", exc_info=True)
+                return {"name": "group_unset_essence", "content": "取消精华未能生效，请稍后重试"}
 
     @Tool("group_recall_msg", description="撤回指定消息。操作流程: 先在群里请用户回复(引用)目标消息, 用户回复后从回复中提取 message_id 调用本工具。群主/管理员无2分钟限制", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -1015,8 +1094,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=self._to_int(message_id))
                 if not ok: return {"name": "group_recall_msg", "content": f"撤回未能生效: {data}"}
                 return {"name": "group_recall_msg", "content": f"已撤回消息 {message_id}: {reason}"}
-            except Exception as e:
-                return {"name": "group_recall_msg", "content": f"撤回未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-recall 异常: group={group_id}", exc_info=True)
+                return {"name": "group_recall_msg", "content": "撤回未能生效，请稍后重试"}
 
     @Tool("group_get_member", description="查询群成员的身份(owner/admin/member)、昵称和群名片。踢人/禁言前必须先调用此工具确认目标不是群主/管理员", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -1033,11 +1113,12 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_api(api_name="adapter.napcat.group.get_group_member_info", group_id=self._to_int(group_id), user_id=self._to_int(user_id), no_cache=True)
                 if ok and isinstance(data, dict):
                     role = data.get("role", "unknown"); card = data.get("card", ""); nick = data.get("nickname", "")
-                    self._known_roles[(self._to_int(group_id), self._to_int(user_id))] = role
+                    self._known_roles[(group_id, user_id)] = (role, time.time())
                     return {"name": "group_get_member", "content": f"@{user_id}: 昵称={nick}, 群名片={card}, 身份={role}"}
                 return {"name": "group_get_member", "content": f"未找到 @{user_id} 的信息"}
-            except Exception as e:
-                return {"name": "group_get_member", "content": f"查询成员信息未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-get-member 异常: group={group_id} user={user_id}", exc_info=True)
+                return {"name": "group_get_member", "content": "查询成员信息未能生效，请稍后重试"}
 
     @Tool("group_get_shut_list", description="查看当前群的禁言列表", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -1052,8 +1133,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 ok, data = await self._call_action_api(api_name="adapter.napcat.group.get_group_shut_list", group_id=self._to_int(group_id))
                 if ok and isinstance(data, dict): return {"name": "group_get_shut_list", "content": f"禁言列表: {data.get('data', data)}"}
                 return {"name": "group_get_shut_list", "content": "该群当前没有被禁言的用户"}
-            except Exception as e:
-                return {"name": "group_get_shut_list", "content": f"查询禁言列表未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-get-shutlist 异常: group={group_id}", exc_info=True)
+                return {"name": "group_get_shut_list", "content": "查询禁言列表未能生效，请稍后重试"}
 
     @Tool("group_get_notice", description="获取群公告列表(含 notice_id 和 content), 删除公告前必须先调用此工具获取 notice_id", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -1069,8 +1151,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                 if ok and isinstance(data, dict):
                     return {"name": "group_get_notice", "content": f"公告列表: {data.get('data', data)}"}
                 return {"name": "group_get_notice", "content": f"获取公告列表未能生效: {data}"}
-            except Exception as e:
-                return {"name": "group_get_notice", "content": f"获取公告列表未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-get-notice 异常: group={group_id}", exc_info=True)
+                return {"name": "group_get_notice", "content": "获取公告列表未能生效，请稍后重试"}
 
     @Tool("group_get_system_msg", description="获取群的系统消息(含入群申请列表)", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
@@ -1126,8 +1209,9 @@ class GroupAdminPlugin(MaiBotPlugin):
                         return {"name": "group_get_system_msg", "content": "\n".join(result_parts)}
                     return {"name": "group_get_system_msg", "content": "当前没有待处理的入群申请或邀请（公告请用 group_get_notice 获取）"}
                 return {"name": "group_get_system_msg", "content": str(data)}
-            except Exception as e:
-                return {"name": "group_get_system_msg", "content": f"获取系统消息未能生效: {e}"}
+            except Exception:
+                self.ctx.logger.error(f"[群管理] Tool-get-sysmsg 异常: group={group_id}", exc_info=True)
+                return {"name": "group_get_system_msg", "content": "获取系统消息未能生效，请稍后重试"}
 
     # =========================================================================
     # Command: /admin 系列 (8个)
@@ -1270,6 +1354,16 @@ class GroupAdminPlugin(MaiBotPlugin):
         await self.ctx.send.text(f"已将 {qq} 从群 {gid} 的豁免名单移除", stream_id)
         return True, "", True
 
+    def _clear_runtime_cache(self):
+        """清除运行时缓存，用于 /admin reload 时重置与配置相关的缓存。"""
+        self._group_roles.clear()
+        self._role_refresh_time.clear()
+        self._known_roles.clear()
+        self._stream_to_group.clear()
+        self._disabled_groups.clear()
+        self._get_member_called.clear()
+        self._last_mute_time.clear()
+
     @Command("admin_reload", description="热重载配置", pattern=r"/admin\s+reload")
     async def cmd_admin_reload(self, stream_id: str = "", **kwargs: Any):
         self.ctx.logger.info(f"[群管理] Cmd-reload: stream={stream_id}")
@@ -1280,9 +1374,11 @@ class GroupAdminPlugin(MaiBotPlugin):
             return True, "", True
         try:
             self.set_plugin_config(self.config.model_dump())
-            await self.ctx.send.text("插件配置已刷新", stream_id)
-        except Exception as e:
-            await self.ctx.send.text(f"刷新失败: {e}", stream_id)
+            self._clear_runtime_cache()
+            await self.ctx.send.text("插件配置已刷新（运行时缓存已清空）", stream_id)
+        except Exception:
+            self.ctx.logger.error("[群管理] 配置刷新异常", exc_info=True)
+            await self.ctx.send.text("刷新失败，请查看日志", stream_id)
         return True, "", True
 
     # =========================================================================
@@ -1312,7 +1408,7 @@ class GroupAdminPlugin(MaiBotPlugin):
             remain = int(sf.mute_cooldown - (time.time() - last_mute))
             await self.ctx.send.text(f"该用户 {remain} 秒前刚被禁言，请稍后再试", stream_id)
             return True, "", True
-        esc = self._check_escalation(qq)
+        esc = self._check_escalation(gid, qq)
         if esc and esc.action == "kick":
             await self.ctx.send.text(f"该用户 {esc.within_hours}h 内已被处罚 {esc.count} 次，建议使用 /kick 踢出", stream_id)
             return True, "", True
@@ -1325,7 +1421,7 @@ class GroupAdminPlugin(MaiBotPlugin):
         if self._daily_mute_count[gid][today] >= sf.daily_mute_limit:
             await self.ctx.send.text(f"今天已经禁言了 {sf.daily_mute_limit} 个用户，已达每日上限", stream_id)
             return True, "", True
-        ok, data = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=duration)
+        ok, _ = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=duration)
         if ok:
             self._last_mute_time[mute_key] = time.time()
             self._daily_mute_count[gid][today] += 1
@@ -1333,7 +1429,7 @@ class GroupAdminPlugin(MaiBotPlugin):
             dur_str = f"{dur_min}分钟" if dur_min > 0 else f"{duration}秒"
             await self._send_at_text(stream_id, f"已将", qq, f"禁言 {dur_str}" + (f"（{reason}）" if reason else ""))
             self._add_log(gid, "mute", qq, reason or "管理员命令", True)
-        else: await self.ctx.send.text(f"禁言未能生效: {data}", stream_id)
+        else: await self.ctx.send.text("禁言未能生效，请检查权限", stream_id)
         return True, "", True
 
     @Command("admin_unmute", description="管理员解禁: /unmute @qq|昵称", pattern=r"^/unmute\s+@?(?P<target>\S+)")
@@ -1346,9 +1442,9 @@ class GroupAdminPlugin(MaiBotPlugin):
         qq = await self._resolve_target(gid, target, stream_id)
         if not qq: return True, "", True
         if not await self._check_admin_permission(stream_id, gid, kwargs): return True, "", True
-        ok, data = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=0)
+        ok, _ = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=0)
         if ok: await self._send_at_text(stream_id, "已解除", qq, "的禁言")
-        else: await self.ctx.send.text(f"解禁未能生效: {data}", stream_id)
+        else: await self.ctx.send.text("解禁未能生效，请检查权限", stream_id)
         return True, "", True
 
     @Command("admin_kick", description="管理员踢人: /kick @qq|昵称 原因", pattern=r"^/kick\s+@?(?P<target>\S+)\s*(?P<reason>.*)?")
@@ -1363,7 +1459,7 @@ class GroupAdminPlugin(MaiBotPlugin):
         if not await self._check_admin_permission(stream_id, gid, kwargs): return True, "", True
         is_protected, msg = await self._is_protected(gid, qq)
         if is_protected: await self.ctx.send.text(f"操作被拦截: {msg}", stream_id); return True, "", True
-        esc = self._check_escalation(qq)
+        esc = self._check_escalation(gid, qq)
         if esc and esc.action == "mute":
             await self.ctx.send.text(f"处罚阶梯建议先禁言 {esc.max_duration} 秒而非直接踢出，请使用 /mute", stream_id)
             return True, "", True
@@ -1373,12 +1469,12 @@ class GroupAdminPlugin(MaiBotPlugin):
         if self._daily_kick_count[gid][today] >= self.config.safeguard.daily_kick_limit:
             await self.ctx.send.text(f"今天已经踢出了 {self.config.safeguard.daily_kick_limit} 个用户，已达每日上限", stream_id)
             return True, "", True
-        ok, data = await self._call_api(api_name="adapter.napcat.group.set_group_kick", group_id=gid, user_id=qq, reject_add_request=False)
+        ok, _ = await self._call_api(api_name="adapter.napcat.group.set_group_kick", group_id=gid, user_id=qq, reject_add_request=False)
         if ok:
             await self._send_at_text(stream_id, "已踢出", qq, reason if reason else "")
             self._daily_kick_count[gid][today] += 1
             self._add_log(gid, "kick", qq, reason or "管理员命令", True)
-        else: await self.ctx.send.text(f"踢出未能生效: {data}", stream_id)
+        else: await self.ctx.send.text("踢出未能生效，请检查权限", stream_id)
         return True, "", True
 
     @Command("admin_warn", description="管理员警告: /warn @qq|昵称 spam/abuse/ad 原因", pattern=r"^/warn\s+@?(?P<target>\S+)\s+(?P<type>spam|abuse|ad)\s*(?P<reason>.*)?")
@@ -1391,7 +1487,8 @@ class GroupAdminPlugin(MaiBotPlugin):
         qq = await self._resolve_target(gid, target, stream_id)
         if not qq: return True, "", True
         if not await self._check_admin_permission(stream_id, gid, kwargs): return True, "", True
-        self._warnings.setdefault(qq, {}).setdefault(vtype, []).append((time.time(), 1))
+        async with self._lock:
+            self._warnings.setdefault(gid, {}).setdefault(qq, {}).setdefault(vtype, []).append((time.time(), 1))
         self._add_log(gid, "warn", qq, reason or "管理员命令", True)
         type_cn = {"spam": "刷屏", "abuse": "辱骂", "ad": "广告"}.get(vtype, vtype)
         await self._send_at_text(stream_id, f"已提醒", qq, f"[{type_cn}]" + (f"（{reason}）" if reason else ""))
@@ -1422,8 +1519,8 @@ class GroupAdminPlugin(MaiBotPlugin):
         if not await self._check_admin_permission(stream_id, gid, kwargs): return True, "", True
         msg_id = self._get_reply_msg_id(kwargs)
         if not msg_id: await self.ctx.send.text("请先回复目标消息再使用 /essence", stream_id); return True, "", True
-        ok, data = await self._call_action_api(api_name="adapter.napcat.group.set_essence_msg", group_id=gid, message_id=msg_id)
-        await self.ctx.send.text("已设为精华消息" if ok else f"未能生效: {data}", stream_id)
+        ok, _ = await self._call_action_api(api_name="adapter.napcat.group.set_essence_msg", group_id=gid, message_id=msg_id)
+        await self.ctx.send.text("已设为精华消息" if ok else "设精华未能生效，请检查权限", stream_id)
         return True, "", True
 
     @Command("admin_recall", description="撤回: 回复消息后 /recall", pattern=r"/recall")
@@ -1433,8 +1530,8 @@ class GroupAdminPlugin(MaiBotPlugin):
         if not await self._check_admin_permission(stream_id, gid, kwargs): return True, "", True
         msg_id = self._get_reply_msg_id(kwargs)
         if not msg_id: await self.ctx.send.text("请先回复目标消息再使用 /recall", stream_id); return True, "", True
-        ok, data = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=self._to_int(msg_id))
-        await self.ctx.send.text("已撤回" if ok else f"未能生效: {data}", stream_id)
+        ok, _ = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=self._to_int(msg_id))
+        await self.ctx.send.text("已撤回" if ok else "撤回未能生效，请检查权限", stream_id)
         return True, "", True
 
     @Command("admin_shutlist", description="查看禁言列表: /shutlist", pattern=r"/shutlist")
@@ -1444,7 +1541,7 @@ class GroupAdminPlugin(MaiBotPlugin):
         if not await self._check_admin_permission(stream_id, gid, kwargs): return True, "", True
         ok, data = await self._call_action_api(api_name="adapter.napcat.group.get_group_shut_list", group_id=gid)
         if ok and isinstance(data, dict): await self.ctx.send.text(f"禁言列表: {data.get('data', data)}", stream_id)
-        else: await self.ctx.send.text(f"查询未能生效: {data}", stream_id)
+        else: await self.ctx.send.text("查询未能生效，请稍后重试", stream_id)
         return True, "", True
 
     # =========================================================================
@@ -1462,16 +1559,13 @@ class GroupAdminPlugin(MaiBotPlugin):
             ac = mi.get("additional_config", {}) or {}
             group_id = self._to_int(gi.get("group_id", 0))
             self_id = ac.get("self_id")
-            if self_id and group_id: self._bot_self_id[group_id] = self._to_int(self_id)
+            if self_id and not self._bot_self_id: self._bot_self_id = self._to_int(self_id)
             if group_id:
                 if stream_id: self._stream_to_group[stream_id] = group_id
                 sid = str(kwargs.get("session_id", ""))
                 if sid: self._stream_to_group[sid] = group_id
         if not group_id or not self._is_group_enabled(group_id): return {"continue_processing": True}
         await self._ensure_bot_role(group_id)
-        self._msg_counter[group_id] = self._msg_counter.get(group_id, 0) + 1
-        if self._msg_counter[group_id] > 100000:
-            self._msg_counter[group_id] = 0
         if time.time() - self._last_cleanup_time > 3600:
             self._cleanup_memory()
         return {"continue_processing": True}

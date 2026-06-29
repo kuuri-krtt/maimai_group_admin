@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.4.0",
+  "version": "1.5.0",
   "name": "群管理助手",
-  "description": "群管理助手 v1.4 — 18个管理工具+15条快捷命令+4个HookHandler。按群注入管理提示词，精确获取各群bot角色，自动审核/禁言/踢人/精华/公告/审批入群。",
+  "description": "群管理助手 v1.5 — 18个管理工具+15条快捷命令+4个HookHandler。按群注入管理提示词，8步安全护栏，缓存TTL/跨群隔离/内存清理/竞态加锁全面修复。",
   "author": {
     "name": "DeepSeek-V4",
     "url": "https://github.com/DeepSeek-V4-Pro"

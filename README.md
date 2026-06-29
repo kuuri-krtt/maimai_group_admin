@@ -1,6 +1,6 @@
 # 群管理助手 — LLM 自主管理 QQ 群插件
 
-**v1.4 | 18 个管理 Tool + 15 条快捷命令 + 4 个 HookHandler（chat.receive 缓存 + 双路注入 + 守门）**，让 Bot 自主监控群聊、识别违规并执行管理操作（禁言、踢人、撤回、设精华、公告、审批入群等），同时提供人类管理员的命令控制台。
+**v1.5 | 18 个管理 Tool + 15 条快捷命令 + 4 个 HookHandler（chat.receive 缓存 + 双路注入 + 守门）**，让 Bot 自主监控群聊、识别违规并执行管理操作（禁言、踢人、撤回、设精华、公告、审批入群等），同时提供人类管理员的命令控制台。
 
 ---
 
@@ -98,7 +98,7 @@ WebUI → 插件管理 → 找到 `maimai.group-admin` → 点击启用
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | bool | `false` | 插件总开关，设为 `true` 后插件才开始工作 |
-| `config_version` | string | `"1.4.0"` | 配置版本号，升级插件时用于迁移判断，**请勿手动修改** |
+| `config_version` | string | `"1.5.0"` | 配置版本号，升级插件时用于迁移判断，**请勿手动修改** |
 
 ---
 
@@ -679,7 +679,7 @@ max_duration = 1800          # 首次就禁言30分钟
 
 ---
 
-## v1.4 功能总览
+## v1.5 功能总览
 
 | 模块 | 数量 | 详情 |
 |------|:---:|------|
@@ -698,6 +698,45 @@ max_duration = 1800          # 首次就禁言30分钟
 ---
 
 ## 更新日志
+
+### v1.5.0 (2026-06-30)
+
+**全面质量修复（22 项）**
+
+**缓存生命周期（8 项）**
+- `_known_roles` 值改为 `(role, timestamp)` 元组，读写均带 3600s TTL，清理按时间戳排序淘汰
+- `_last_mute_time` / `_get_member_called` 在 `_cleanup_memory` 中按时清理过期条目
+- `_daily_*_count` 在 `_check_daily_reset` 中清理旧日 key
+- 删除死代码 `_msg_counter`
+- 新增独立 `_cleanup_task`（每 600s 运行），不再依赖 `auto_approve` 或事件驱动
+- `_bot_self_id` 改为全局单值 `Optional[int]`，从任意群首次消息即可赋值
+
+**跨群统计隔离（5 项）**
+- `_warnings` 结构改为 `{group_id: {user_id: {vtype: [(ts,c)]}}}`，所有读写按群隔离
+- `_check_escalation` / `_count_ops_in_window` 加入 `group_id` 过滤
+- `_check_warning_threshold` 新增 `group_id` 参数
+- `_check_join_requests` 合并 `auto_moderate.enabled_groups` + `auto_approve.groups[]`
+- 修复 `auto_approve.groups` 中单独配置的群被 `_is_group_enabled` 跳过的 bug
+
+**竞态条件（2 项）**
+- `_check_join_requests` 中 approve/reject 分支的计数修改加 `async with self._lock`
+- `cmd_admin_warn` 写入 `_warnings` 加 `async with self._lock`
+
+**管理员体验（4 项）**
+- `/admin reload` 新增 `_clear_runtime_cache()` 清空角色/群组/流映射等缓存
+- `on_config_update` 自动重启 `_auto_check_task`
+- 自动审批前加入 `_is_protected` 检查
+- `tool_warn_user` 优先使用 `stream_id` 发送消息
+
+**异常处理统一（27 处）**
+- 全 17 个 Tool + 2 个后台循环 + 1 个 Command：`logger.error("...", exc_info=True)`（含完整 traceback）
+- 5 个 API 层 helper：`logger.warning(f"...: {e}")`（简洁消息）
+- 2 个数据质量兜底：静默
+- `_call_api` / `_call_action_api` 新增日志
+- `_resolve_target` 裸 `except: pass` → 加日志
+- `_ensure_bot_role` 异常→加日志
+- 所有 `[群管理]` 前缀 100% 覆盖
+- 6 个 Command 中未使用变量 `data` → `_`
 
 ### v1.4.0 (2026-06-28)
 
