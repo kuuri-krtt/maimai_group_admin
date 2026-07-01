@@ -139,6 +139,9 @@ WebUI → 插件管理 → 找到 `maimai.group-admin` → 点击启用
 |------|------|--------|------|
 | `enabled` | bool | `true` | 是否启用 LLM 自动审核（v1.4: chat.receive 缓存 + 双路注入，按群精确注入） |
 | `enabled_groups` | list[string] | `[]` | **必须填写**需要管理的群号列表，如 `["123456789"]`。留空不生效 |
+| `audit_model` | string | `"planner"` | 入站 LLM 审核使用的任务模型，如 `planner` / `utils` / `replyer` |
+| `audit_max_tokens` | int | `220` | 入站 LLM 审核最大输出 token 数；使用思考模型或 JSON 被截断时可调大 |
+| `treat_forwarded_records_as_single_message` | bool | `true` | 将 QQ 合并转发聊天记录作为单条消息整体审核，不把转发内部多条记录视为发送者连续刷屏 |
 
 > **注意**：`enabled_groups` 为空时插件不会在任何群启动自动审核。
 

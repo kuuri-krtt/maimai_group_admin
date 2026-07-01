@@ -11,8 +11,11 @@ v1.5: 全面修复三大类缺陷 — 缓存生命周期(TTL + 独立清理任�
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import re
 import time
+import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, ClassVar, Optional
@@ -48,6 +51,12 @@ class AutoModerateSectionConfig(PluginConfigBase):
     __ui_label__ = "自动审核"; __ui_icon__ = "zap"; __ui_order__ = 3
     enabled: bool = Field(default=True, description="是否启用自动审核")
     enabled_groups: list[str] = Field(default_factory=list, description="启用插件的群号白名单")
+    audit_model: str = Field(default="planner", description="入站LLM审核使用的任务模型，如 planner/utils/replyer")
+    audit_max_tokens: int = Field(default=220, description="入站LLM审核最大输出token数")
+    treat_forwarded_records_as_single_message: bool = Field(
+        default=True,
+        description="将QQ合并转发聊天记录作为单条消息整体审核，不把内部多条记录视为发送者连续刷屏",
+    )
 
 class SafeguardSectionConfig(PluginConfigBase):
     __ui_label__ = "安全管理"; __ui_icon__ = "shield-off"; __ui_order__ = 4
@@ -162,6 +171,9 @@ class GroupAdminPlugin(MaiBotPlugin):
         self._daily_approve_count: dict[int, dict[str, int]] = {}
         self._daily_reject_count: dict[int, dict[str, int]] = {}
         self._warnings: dict[int, dict[int, dict[str, list[tuple[float, int]]]]] = {}
+        self._recent_user_messages: dict[tuple[Any, ...], deque[tuple[float, str]]] = {}
+        self._audit_tasks: dict[tuple[Any, ...], asyncio.Task] = {}
+        self._audit_seen_messages: dict[str, float] = {}
         self._op_log: deque[dict[str, Any]] = deque(maxlen=5000)
         self._get_member_called: dict[int, dict[int, float]] = {}
         self._last_mute_time: dict[tuple[int, int], float] = {}
@@ -182,6 +194,10 @@ class GroupAdminPlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         self._stop_auto_check()
         self._stop_cleanup()
+        for task in list(self._audit_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._audit_tasks.clear()
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         if scope != "self":
@@ -415,6 +431,19 @@ class GroupAdminPlugin(MaiBotPlugin):
                     del self._get_member_called[gid][uid]
             if not self._get_member_called[gid]:
                 del self._get_member_called[gid]
+        for key in list(self._recent_user_messages.keys()):
+            self._recent_user_messages[key] = deque(
+                ((ts, text) for ts, text in self._recent_user_messages[key] if now - ts <= 900),
+                maxlen=8,
+            )
+            if not self._recent_user_messages[key]:
+                del self._recent_user_messages[key]
+        for key, task in list(self._audit_tasks.items()):
+            if task.done():
+                del self._audit_tasks[key]
+        for msg_id, ts in list(self._audit_seen_messages.items()):
+            if now - ts > 900:
+                del self._audit_seen_messages[msg_id]
         self._last_cleanup_time = now
 
     # ===== Prompt 构建 =====
@@ -437,6 +466,836 @@ class GroupAdminPlugin(MaiBotPlugin):
         sections.append(core)
         sections.append("以上为群管理参考信息，不要在你的回复中引用或解释这一段文字。")
         return "\n\n".join(sections)
+
+    def _extract_message_text(self, message: Any) -> str:
+        if not isinstance(message, dict):
+            return str(message or "").strip()
+        reply_text = self._extract_non_reply_segment_text(message)
+        if reply_text:
+            return reply_text
+        for key in ("plain_text", "processed_plain_text", "raw_message", "text", "content"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        segments = message.get("message_segments")
+        if isinstance(segments, list):
+            parts = self._extract_segment_text_parts(segments)
+            if parts:
+                return " ".join(parts).strip()
+        return ""
+
+    def _is_reply_context_segment(self, seg: Any) -> bool:
+        if not isinstance(seg, dict):
+            return False
+        seg_type = str(seg.get("type") or seg.get("message_type") or "").strip().lower()
+        return seg_type in ("reply", "quote", "quoted", "reference", "source")
+
+    def _extract_segment_text_parts(self, segments: Any, skip_reply_context: bool = False) -> list[str]:
+        if not isinstance(segments, list):
+            return []
+        parts: list[str] = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            if skip_reply_context and self._is_reply_context_segment(seg):
+                continue
+            data = seg.get("data", {})
+            if isinstance(data, str):
+                if data.strip():
+                    parts.append(data)
+            elif isinstance(data, dict):
+                for key in ("text", "content", "summary", "title", "name", "desc"):
+                    text = data.get(key)
+                    if text:
+                        parts.append(str(text))
+                news = data.get("news")
+                if isinstance(news, list):
+                    for item in news:
+                        if isinstance(item, dict):
+                            item_text = item.get("text") or item.get("title") or item.get("content")
+                            if item_text:
+                                parts.append(str(item_text))
+        return parts
+
+    def _extract_non_reply_segment_text(self, message: dict[str, Any]) -> str:
+        for key in ("message_segments", "raw_message", "segments"):
+            segments = message.get(key)
+            if not isinstance(segments, list):
+                continue
+            if not any(self._is_reply_context_segment(seg) for seg in segments if isinstance(seg, dict)):
+                continue
+            parts = self._extract_segment_text_parts(segments, skip_reply_context=True)
+            text = " ".join(parts).strip()
+            if text:
+                return text
+        return ""
+
+    def _iter_message_segments(self, value: Any, skip_reply_context: bool = False):
+        if isinstance(value, dict):
+            if skip_reply_context and self._is_reply_context_segment(value):
+                return
+            yield value
+            for key in ("message_segments", "raw_message", "segments", "content", "data", "message"):
+                nested = value.get(key)
+                if nested is value:
+                    continue
+                yield from self._iter_message_segments(nested, skip_reply_context=skip_reply_context)
+        elif isinstance(value, list):
+            for item in value:
+                yield from self._iter_message_segments(item, skip_reply_context=skip_reply_context)
+
+    def _extract_image_segments(self, message: Any) -> list[dict[str, str]]:
+        if not isinstance(message, dict):
+            return []
+        images: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for seg in self._iter_message_segments(message, skip_reply_context=True):
+            seg_type = str(seg.get("type") or seg.get("message_type") or "").strip().lower()
+            data = seg.get("data", {})
+            data_dict = data if isinstance(data, dict) else {}
+            if seg_type not in ("image", "emoji") and not any(
+                data_dict.get(key) or seg.get(key)
+                for key in ("binary_data_base64", "base64", "image_base64", "emoji_base64", "hash")
+            ):
+                continue
+            image_hash = str(
+                seg.get("hash")
+                or seg.get("binary_hash")
+                or data_dict.get("hash")
+                or data_dict.get("file_hash")
+                or data_dict.get("image_hash")
+                or ""
+            ).strip()
+            image_base64 = str(
+                seg.get("binary_data_base64")
+                or seg.get("base64")
+                or seg.get("image_base64")
+                or seg.get("emoji_base64")
+                or data_dict.get("binary_data_base64")
+                or data_dict.get("base64")
+                or data_dict.get("image_base64")
+                or data_dict.get("emoji_base64")
+                or ""
+            ).strip()
+            image_format = str(
+                seg.get("image_format")
+                or seg.get("format")
+                or data_dict.get("image_format")
+                or data_dict.get("format")
+                or ""
+            ).strip().lower()
+            image_url = str(
+                seg.get("url")
+                or seg.get("file")
+                or data_dict.get("url")
+                or data_dict.get("file")
+                or ""
+            ).strip()
+            if not image_format:
+                filename = image_url
+                suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                image_format = suffix if suffix in ("jpg", "jpeg", "png", "gif", "webp") else ""
+            if image_hash or image_base64 or image_url.startswith(("http://", "https://")):
+                key = (image_hash, image_base64[:64], image_url, image_format)
+                if key in seen:
+                    continue
+                seen.add(key)
+                images.append({"hash": image_hash, "base64": image_base64, "url": image_url, "format": image_format})
+        return images
+
+    def _is_forwarded_chat_record(self, message: Any, text: str = "") -> bool:
+        """Best-effort detection for QQ merged-forward chat records."""
+        if isinstance(message, dict):
+            for seg in self._iter_message_segments(message, skip_reply_context=True):
+                if not isinstance(seg, dict):
+                    continue
+                seg_type = str(seg.get("type") or seg.get("message_type") or "").strip().lower()
+                data = seg.get("data", {})
+                data_dict = data if isinstance(data, dict) else {}
+                if seg_type in ("forward", "merged_forward", "forward_msg", "node"):
+                    return True
+                if seg_type in ("xml", "json"):
+                    payload = " ".join(
+                        str(value)
+                        for value in (
+                            data if isinstance(data, str) else "",
+                            data_dict.get("data", ""),
+                            data_dict.get("content", ""),
+                            data_dict.get("text", ""),
+                        )
+                        if value
+                    )
+                    if any(marker in payload for marker in ("聊天记录", "合并转发", "转发的聊天记录")):
+                        return True
+                if any(data_dict.get(key) for key in ("forward_id", "resid", "node_id")) and any(
+                    marker in str(data_dict) for marker in ("聊天记录", "转发")
+                ):
+                    return True
+
+        normalized = re.sub(r"\s+", "", str(text or ""))
+        if not normalized:
+            return False
+        markers = (
+            "合并转发",
+            "转发聊天记录",
+            "转发的聊天记录",
+            "群聊的聊天记录",
+            "查看转发消息",
+            "这串转发",
+            "[聊天记录]",
+            "【聊天记录】",
+        )
+        if any(marker in normalized for marker in markers):
+            return True
+        if re.search(r".{1,30}的聊天记录", normalized):
+            return True
+        return False
+
+    def _extract_forward_record_ids(self, message: Any, text: str = "") -> list[str]:
+        ids: list[str] = []
+
+        def _add(value: Any) -> None:
+            token = str(value or "").strip()
+            if token and token not in ids:
+                ids.append(token)
+
+        if isinstance(message, dict):
+            for seg in self._iter_message_segments(message, skip_reply_context=True):
+                if not isinstance(seg, dict):
+                    continue
+                seg_type = str(seg.get("type") or seg.get("message_type") or "").strip().lower()
+                data = seg.get("data", {})
+                data_dict = data if isinstance(data, dict) else {}
+                if seg_type in ("forward", "merged_forward", "forward_msg"):
+                    for key in ("forward_id", "resid", "id", "file"):
+                        _add(seg.get(key) or data_dict.get(key))
+                for key in ("forward_id", "resid"):
+                    _add(seg.get(key) or data_dict.get(key))
+
+        for pattern in (
+            r"(?:forward_id|resid)\s*[:=]\s*['\"]?([A-Za-z0-9_\-+/=]{8,})",
+            r'"(?:forward_id|resid)"\s*:\s*"([^"]+)"',
+        ):
+            for match in re.finditer(pattern, str(text or "")):
+                _add(match.group(1))
+        return ids
+
+    def _merge_image_segments(self, first: list[dict[str, str]], second: list[dict[str, str]]) -> list[dict[str, str]]:
+        merged: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for image in [*first, *second]:
+            if not isinstance(image, dict):
+                continue
+            normalized = {
+                "hash": str(image.get("hash") or "").strip(),
+                "base64": str(image.get("base64") or "").strip(),
+                "url": str(image.get("url") or "").strip(),
+                "format": str(image.get("format") or "").strip(),
+            }
+            key = (normalized["hash"], normalized["base64"][:64], normalized["url"], normalized["format"])
+            if key in seen or not (normalized["hash"] or normalized["base64"] or normalized["url"]):
+                continue
+            seen.add(key)
+            merged.append(normalized)
+        return merged
+
+    def _render_forward_payload_text(self, value: Any, depth: int = 0) -> str:
+        if depth > 8:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            parts = self._extract_segment_text_parts(value)
+            if parts:
+                return " ".join(parts).strip()
+            return "\n".join(
+                part for item in value if (part := self._render_forward_payload_text(item, depth + 1))
+            ).strip()
+        if not isinstance(value, dict):
+            return ""
+
+        data = value.get("data", {})
+        data_dict = data if isinstance(data, dict) else {}
+        seg_type = str(value.get("type") or value.get("message_type") or "").strip().lower()
+        if seg_type == "text":
+            return str(value.get("text") or data_dict.get("text") or data or "").strip()
+
+        for key in ("text", "content", "summary", "title", "desc", "message"):
+            content = value.get(key)
+            if content:
+                rendered = self._render_forward_payload_text(content, depth + 1)
+                if rendered:
+                    return rendered
+            content = data_dict.get(key)
+            if content:
+                rendered = self._render_forward_payload_text(content, depth + 1)
+                if rendered:
+                    return rendered
+        return ""
+
+    def _render_forward_payload(self, payload: Any, depth: int = 0) -> tuple[str, list[dict[str, str]]]:
+        if depth > 8:
+            return "", []
+        images: list[dict[str, str]] = []
+        lines: list[str] = []
+
+        if isinstance(payload, dict):
+            images = self._merge_image_segments(images, self._extract_image_segments(payload))
+            data = payload.get("data")
+            if isinstance(data, dict) and any(key in data for key in ("messages", "message", "content")):
+                text, nested_images = self._render_forward_payload(data, depth + 1)
+                return text, self._merge_image_segments(images, nested_images)
+
+            for list_key in ("messages", "nodes", "forward", "forward_messages"):
+                items = payload.get(list_key)
+                if isinstance(items, list):
+                    for item in items:
+                        text, nested_images = self._render_forward_payload(item, depth + 1)
+                        if text:
+                            lines.append(text)
+                        images = self._merge_image_segments(images, nested_images)
+                    return "\n".join(lines).strip(), images
+
+            content = payload.get("content") or payload.get("message") or (data.get("content") if isinstance(data, dict) else None)
+            if content:
+                sender = ""
+                if isinstance(data, dict):
+                    sender = str(data.get("name") or data.get("nickname") or data.get("uin") or "").strip()
+                sender = sender or str(payload.get("name") or payload.get("nickname") or payload.get("user_id") or "").strip()
+                text = self._render_forward_payload_text(content, depth + 1)
+                _, nested_images = self._render_forward_payload(content, depth + 1)
+                images = self._merge_image_segments(images, nested_images)
+                if text:
+                    return (f"【{sender}】: {text}" if sender else text), images
+
+            text = self._render_forward_payload_text(payload, depth + 1)
+            return text, images
+
+        if isinstance(payload, list):
+            for item in payload:
+                text, nested_images = self._render_forward_payload(item, depth + 1)
+                if text:
+                    lines.append(text)
+                images = self._merge_image_segments(images, nested_images)
+            return "\n".join(lines).strip(), images
+
+        return self._render_forward_payload_text(payload, depth + 1), images
+
+    async def _expand_forwarded_record_for_audit(
+        self,
+        message: Any,
+        text: str,
+        image_segments: list[dict[str, str]],
+    ) -> tuple[str, list[dict[str, str]]]:
+        forward_ids = self._extract_forward_record_ids(message, text)
+        if not forward_ids:
+            return text, image_segments
+
+        api_names = (
+            "adapter.napcat.message.get_forward_msg",
+            "adapter.napcat.get_forward_msg",
+            "adapter.napcat.forward.get_forward_msg",
+            "adapter.onebot.get_forward_msg",
+            "get_forward_msg",
+        )
+        arg_names = ("message_id", "id", "forward_id", "resid")
+        last_error = ""
+        for forward_id in forward_ids[:3]:
+            for api_name in api_names:
+                for arg_name in arg_names:
+                    ok, data = await self._call_api(api_name=api_name, **{arg_name: forward_id})
+                    if not ok:
+                        last_error = str(data)
+                        continue
+                    expanded_text, expanded_images = self._render_forward_payload(data)
+                    if not expanded_text and not expanded_images:
+                        continue
+                    merged_images = self._merge_image_segments(image_segments, expanded_images)
+                    if expanded_text and expanded_text not in text:
+                        text = f"{text}\n\n[合并转发展开内容]\n{expanded_text}".strip()
+                    if self.config.logging.verbose_logging:
+                        self.ctx.logger.info(
+                            f"[群管理] 合并转发展开成功: id={forward_id} api={api_name} "
+                            f"text_len={len(expanded_text)} images={len(expanded_images)}"
+                        )
+                    return text, merged_images
+
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.warning(
+                f"[群管理] 合并转发展开失败: ids={forward_ids[:3]} err={last_error or 'no usable get_forward_msg api'}"
+            )
+        return text, image_segments
+
+    def _decode_image_base64(self, image_base64: str) -> bytes:
+        image_base64 = str(image_base64 or "").strip()
+        if image_base64.startswith("data:") and ";base64," in image_base64:
+            image_base64 = image_base64.split(";base64,", maxsplit=1)[1].strip()
+        return base64.b64decode(image_base64, validate=True)
+
+    def _download_image_url_sync(self, image_url: str, timeout: float = 8.0, max_bytes: int = 10 * 1024 * 1024) -> bytes:
+        image_url = str(image_url or "").strip()
+        if not image_url.startswith(("http://", "https://")):
+            return b""
+        request = urllib.request.Request(image_url, headers={"User-Agent": "MaiBot-GroupAdmin/1.0"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if content_type and not content_type.startswith("image/"):
+                return b""
+            data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return b""
+        return data
+
+    def _extract_message_user_id(self, message: Any, kwargs: dict[str, Any]) -> int:
+        for key in ("user_id", "sender_id"):
+            uid = self._to_int(kwargs.get(key, 0))
+            if uid:
+                return uid
+        if not isinstance(message, dict):
+            return 0
+        mbi = message.get("message_base_info", {}) or {}
+        uid = self._to_int(mbi.get("user_id", 0))
+        if uid:
+            return uid
+        mi = message.get("message_info", {}) or {}
+        ui = mi.get("user_info", {}) or {}
+        return self._to_int(ui.get("user_id", 0))
+
+    def _extract_json_object(self, text: str) -> dict[str, Any]:
+        text = text.strip()
+        candidates = [text]
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
+        if match:
+            candidates.insert(0, match.group(1))
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(text[start : end + 1])
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+        return {}
+
+    def _is_vlm_sensitive_refusal(self, text: str) -> bool:
+        if not text.lstrip().startswith("[图片消息]"):
+            return False
+        refusal_markers = (
+            "抱歉，我无法满足",
+            "无法按要求描述",
+            "无法描述这张图片",
+            "不能描述这张图片",
+            "不能协助描述",
+            "无法提供该图片的具体内容",
+        )
+        return any(marker in text for marker in refusal_markers)
+
+    def _build_audit_prompt(
+        self,
+        group_id: int,
+        user_id: int,
+        text: str,
+        history: list[tuple[float, str]],
+        forwarded_record_single_message: bool = False,
+    ) -> str:
+        recent_lines = []
+        now = time.time()
+        for ts, item in history[-6:]:
+            age = max(0, int(now - ts))
+            recent_lines.append(f"- {age}s ago: {item}")
+        recent = "\n".join(recent_lines) if recent_lines else "- none"
+        forwarded_note = (
+            "注意：current_message 是用户发送的一条QQ合并转发聊天记录。请把整串转发作为这一条当前消息整体判断；"
+            "刷屏判定时只按当前发送者发了一条消息计数，不要把转发内部的多条聊天记录当成该用户连续刷屏，也不要按内部发言人的 user_id 处理。"
+            "但内容审核仍需认真检查转发内部所有可见文本和可取得的图片描述：如果整串转发传播广告、诈骗、色情、违法、严重辱骂、隐私泄露等风险内容，"
+            "应按当前发送者传播该内容处理。\n\n"
+            if forwarded_record_single_message
+            else ""
+        )
+        return (
+            "你是QQ群入站消息审核器。请根据语义判断是否需要群管理动作，不要按关键词机械判定。\n"
+            "你需要识别：连续刷屏、辱骂/人身攻击、广告/诈骗/赌博/交易诱导、色情/违法/血腥惊吓、恶意引战。\n"
+            "如果 current_message 是图片描述，需按图片内容判断；图片描述模型拒答（如“抱歉，我无法满足该请求”、“无法描述该图片”、“不能协助”）"
+            "代表视觉模型已经遇到高风险敏感图像，不允许返回 none；应按最可能类型返回 warn 或 mute，并设置 recall=true。\n"
+            "如果图片描述出现裸露、色情意味、露骨、挑逗姿势、性暗示、下体/性器官、体液、血腥暴力或违法内容，也不允许仅提醒不撤回；"
+            "应设置 recall=true，violation_type 优先使用 sexual 或 illegal。\n"
+            "普通口癖、玩笑、轻微情绪、无明确对象的吐槽、正常聊天，一律不要处罚。\n"
+            "只有把握较高时才返回 warn 或 mute；不确定必须返回 none。\n\n"
+            "recall 表示是否应该撤回当前这条消息：广告/诈骗链接、严重辱骂、色情违法、隐私泄露等应为 true；"
+            "普通刷屏或不确定时应为 false。\n"
+            f"{forwarded_note}"
+            "Do not classify a single file share or a single link as spam. Only classify spam when same_user_recent_messages shows the same user repeatedly sent highly similar content.\n"
+            f"group_id: {group_id}\nuser_id: {user_id}\n"
+            f"same_user_recent_messages:\n{recent}\n\n"
+            f"current_message:\n{text}\n\n"
+            "只输出一个 JSON 对象，不要解释：\n"
+            '{"action":"none|warn|mute","violation_type":"none|spam|abuse|ad|sexual|illegal|conflict",'
+            '"confidence":0.0,"duration":0,"recall":false,"reason":"简短中文原因"}\n'
+            "duration 仅 action=mute 时使用，单位秒；轻度刷屏 300-600，辱骂/广告 600-1800，严重风险最高 3600。"
+        )
+
+    async def _generate_moderation_notice(self, violation_type: str, reason: str) -> str:
+        prompt = (
+            "你是当前群聊里的角色“星期六”，需要对刚刚的群管理处理自然接一句短话。\n"
+            "要求：保持人设和口吻，像群里自然说话；不要说“已警告/已禁言/系统判定/插件/审核”；"
+            "不要长篇说教，不要@任何人，不要输出括号说明。\n"
+            f"违规类型：{violation_type}\n原因：{reason}\n"
+            "只输出一句中文短回复。"
+        )
+        try:
+            result = await self.ctx.llm.generate(prompt=prompt, model="replyer", temperature=0.6, max_tokens=60)
+            if isinstance(result, dict) and result.get("success"):
+                text = str(result.get("response", "")).strip()
+                text = re.sub(r"^```.*?```$", "", text, flags=re.S).strip()
+                text = text.strip('"').strip("'").strip("“”「」")
+                if text:
+                    return text[:120]
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] 生成人设提醒失败: {e}")
+        return "先停一下，这个不太适合继续刷屏喵。"
+
+    async def _resolve_group_stream_id(self, group_id: int, stream_id: str = "") -> str:
+        stream_id = str(stream_id or "").strip()
+        if stream_id:
+            return stream_id
+        try:
+            stream = await self.ctx.call_capability("chat.get_stream_by_group_id", group_id=str(group_id), platform="qq")
+            if isinstance(stream, dict):
+                sid = str(stream.get("stream_id") or stream.get("session_id") or stream.get("id") or "").strip()
+                if sid:
+                    return sid
+            opened = await self.ctx.call_capability(
+                "chat.open_session",
+                platform="qq",
+                chat_type="group",
+                group_id=str(group_id),
+            )
+            if isinstance(opened, dict):
+                stream_obj = opened.get("stream") if isinstance(opened.get("stream"), dict) else opened
+                sid = str(stream_obj.get("stream_id") or stream_obj.get("session_id") or stream_obj.get("id") or "").strip()
+                if sid:
+                    return sid
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] 解析群聊stream失败: group={group_id} err={e}")
+        return ""
+
+    async def _trigger_native_moderation_reply(self, stream_id: str, group_id: int, action: str, violation_type: str, reason: str):
+        stream_id = await self._resolve_group_stream_id(group_id, stream_id)
+        if not stream_id:
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.warning(f"[群管理] 无法触发Maisaka回复: 缺少stream_id group={group_id}")
+            return
+        intent = (
+            "群管理插件刚刚完成了一次违规处理。请基于当前聊天上下文走原生回复流程，"
+            "用你的人设自然回应一句，重点是维持群聊氛围和说明边界；"
+            "不要机械播报禁言结果，不要复述违规原文或链接，不要提插件、审核流程或JSON。"
+            f"处理动作={action}，违规类型={violation_type}，原因={reason}"
+        )
+        try:
+            result = await self.ctx.call_capability(
+                "maisaka.proactive.trigger",
+                stream_id=stream_id,
+                intent=intent,
+                reason="group_admin_moderation_action",
+                priority="high",
+                metadata={
+                    "group_id": group_id,
+                    "action": action,
+                    "violation_type": violation_type,
+                    "reason": reason,
+                },
+            )
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(f"[群管理] 已触发Maisaka原生回复: group={group_id} stream={stream_id} result={result}")
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] 触发Maisaka原生回复失败: group={group_id} stream={stream_id} err={e}")
+
+    async def _maybe_recall_audited_message(self, group_id: int, message_id: str, reason: str) -> None:
+        if not message_id or self._to_int(message_id) <= 0:
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(f"[群管理] 跳过自动撤回: message_id无效 group={group_id} mid={message_id}")
+            return
+        result = await self.tool_recall_msg(group_id=group_id, message_id=message_id, reason=reason)
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(f"[群管理] 自动撤回结果: group={group_id} mid={message_id} result={result}")
+
+    async def _get_image_description_for_audit(self, image_info: dict[str, str], timeout: float = 12.0) -> str:
+        image_hash = str(image_info.get("hash") or "").strip()
+        image_base64 = str(image_info.get("base64") or "").strip()
+        image_url = str(image_info.get("url") or "").strip()
+        try:
+            from src.chat.image_system.image_manager import image_manager
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] 无法导入图片描述管理器: {e}")
+            return ""
+
+        async def _read_description_once() -> str:
+            if image_hash:
+                desc = await image_manager.get_image_description(image_hash=image_hash, wait_for_build=True)
+                if desc:
+                    return str(desc).strip()
+            if image_base64:
+                image_bytes = self._decode_image_base64(image_base64)
+                desc = await image_manager.get_image_description(image_bytes=image_bytes, wait_for_build=True)
+                if desc:
+                    return str(desc).strip()
+            if image_url:
+                image_bytes = await asyncio.to_thread(self._download_image_url_sync, image_url)
+                if image_bytes:
+                    desc = await image_manager.get_image_description(image_bytes=image_bytes, wait_for_build=True)
+                    if desc:
+                        return str(desc).strip()
+            return ""
+
+        deadline = time.time() + timeout
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                desc = await asyncio.wait_for(_read_description_once(), timeout=max(0.5, min(3.0, deadline - time.time())))
+                if desc:
+                    return desc
+            except Exception as e:
+                last_error = str(e)
+                if not image_hash:
+                    break
+            await asyncio.sleep(0.5)
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(
+                f"[群管理] 图片描述为空或超时: hash={image_hash[:12]} has_base64={bool(image_base64)} err={last_error}"
+            )
+        return ""
+
+    async def _run_image_moderation(
+        self,
+        group_id: int,
+        user_id: int,
+        images: list[dict[str, str]],
+        stream_id: str = "",
+        message_id: str = "",
+    ) -> None:
+        try:
+            descriptions: list[str] = []
+            for index, image_info in enumerate(images[:4], start=1):
+                desc = await self._get_image_description_for_audit(image_info)
+                if desc:
+                    image_hash = str(image_info.get("hash") or "").strip()
+                    descriptions.append(f"{index}. hash={image_hash[:12] or 'unknown'} 描述：{desc}")
+            if not descriptions:
+                if self.config.logging.verbose_logging:
+                    self.ctx.logger.info(f"[群管理] 图片审核跳过: 未取得图片描述 group={group_id} user={user_id} mid={message_id}")
+                return
+            audit_text = "[图片消息] 图片描述：\n" + "\n".join(descriptions)
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(
+                    f"[群管理] 图片描述已取得，提交LLM审核: group={group_id} user={user_id} "
+                    f"mid={message_id} descriptions={len(descriptions)}"
+                )
+            self._schedule_llm_moderation(
+                group_id,
+                user_id,
+                audit_text,
+                message_id,
+                stream_id,
+                audit_kind="image",
+            )
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] 图片审核任务异常: group={group_id} user={user_id} mid={message_id} err={e}")
+
+    def _schedule_image_moderation(
+        self,
+        group_id: int,
+        user_id: int,
+        images: list[dict[str, str]],
+        message_id: str = "",
+        stream_id: str = "",
+    ) -> None:
+        if not images or group_id <= 0 or user_id <= 0:
+            return
+        seen_key = f"image_fetch:{message_id}" if message_id else ""
+        if seen_key:
+            if seen_key in self._audit_seen_messages:
+                return
+            self._audit_seen_messages[seen_key] = time.time()
+        task_key: tuple[Any, ...] = (group_id, user_id, "image_fetch", message_id or str(time.time()))
+        existing = self._audit_tasks.get(task_key)
+        if existing and not existing.done():
+            return
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(
+                f"[群管理] 图片审核排队: group={group_id} user={user_id} mid={message_id} images={len(images)}"
+            )
+        self._audit_tasks[task_key] = asyncio.create_task(
+            self._run_image_moderation(group_id, user_id, images, stream_id, message_id)
+        )
+
+    async def _run_llm_moderation(
+        self,
+        group_id: int,
+        user_id: int,
+        text: str,
+        stream_id: str = "",
+        message_id: str = "",
+        task_key: tuple[Any, ...] | None = None,
+        forwarded_record_single_message: bool = False,
+        history_snapshot: list[tuple[float, str]] | None = None,
+    ):
+        try:
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(f"[群管理] 入站LLM审核开始: group={group_id} user={user_id} text_len={len(text)}")
+            is_protected, msg = await self._is_protected(group_id, user_id)
+            if is_protected:
+                if self.config.logging.verbose_logging:
+                    self.ctx.logger.info(f"[群管理] 入站审核跳过受保护用户: group={group_id} user={user_id} reason={msg}")
+                return
+            history = history_snapshot if history_snapshot is not None else list(self._recent_user_messages.get((group_id, user_id), []))
+            prompt = self._build_audit_prompt(group_id, user_id, text, history, forwarded_record_single_message)
+            audit_model = str(self.config.auto_moderate.audit_model or "planner").strip() or "planner"
+            audit_max_tokens = self._to_int(self.config.auto_moderate.audit_max_tokens)
+            if audit_max_tokens <= 0:
+                audit_max_tokens = 220
+            result = await self.ctx.llm.generate(
+                prompt=prompt,
+                model=audit_model,
+                temperature=0.0,
+                max_tokens=audit_max_tokens,
+            )
+            if not isinstance(result, dict) or not result.get("success"):
+                self.ctx.logger.warning(f"[群管理] 入站LLM审核失败: {result}")
+                return
+            verdict = self._extract_json_object(str(result.get("response", "")).strip())
+            action = str(verdict.get("action", "none")).strip().lower()
+            violation_type = str(verdict.get("violation_type", "none")).strip().lower()
+            reason = str(verdict.get("reason", "")).strip()[:120] or "入站审核判定违规"
+            try:
+                confidence = float(verdict.get("confidence", 0))
+            except Exception:
+                confidence = 0.0
+            recall_raw = verdict.get("recall", False)
+            recall_message = recall_raw is True or str(recall_raw).strip().lower() in ("true", "1", "yes")
+            is_image_audit = text.lstrip().startswith("[图片消息]")
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(
+                    f"[群管理] 入站LLM审核结论: group={group_id} user={user_id} "
+                    f"action={action} type={violation_type} confidence={confidence:.2f} "
+                    f"recall={recall_message} reason={reason}"
+                )
+            if (action not in ("warn", "mute") or confidence < 0.72) and is_image_audit and self._is_vlm_sensitive_refusal(text):
+                action = "warn"
+                violation_type = "sexual"
+                confidence = max(confidence, 0.9)
+                recall_message = True
+                reason = "图片描述模型拒绝描述，疑似敏感涉黄内容"
+                if self.config.logging.verbose_logging:
+                    self.ctx.logger.info(
+                        f"[群管理] 图片审核按VLM拒答升级: group={group_id} user={user_id} mid={message_id}"
+                    )
+            if action not in ("warn", "mute") or confidence < 0.72:
+                return
+            valid_violation_types = ("spam", "abuse", "ad", "sexual", "illegal", "conflict")
+            if violation_type not in valid_violation_types:
+                if self.config.logging.verbose_logging:
+                    self.ctx.logger.info(
+                        f"[群管理] 入站LLM审核跳过矛盾结论: group={group_id} user={user_id} "
+                        f"action={action} type={violation_type} confidence={confidence:.2f} reason={reason}"
+                    )
+                return
+            negative_reason_markers = (
+                "未涉及违规",
+                "不涉及违规",
+                "无违规",
+                "没有违规",
+                "未发现违规",
+                "正常聊天",
+                "正常内容",
+                "普通聊天",
+                "无需处理",
+                "无需处罚",
+                "不需要处理",
+                "不应处罚",
+            )
+            if any(marker in reason for marker in negative_reason_markers):
+                if self.config.logging.verbose_logging:
+                    self.ctx.logger.info(
+                        f"[群管理] 入站LLM审核跳过否定原因: group={group_id} user={user_id} "
+                        f"action={action} type={violation_type} confidence={confidence:.2f} reason={reason}"
+                    )
+                return
+            if violation_type == "conflict":
+                violation_type = "abuse"
+            if is_image_audit and violation_type in ("sexual", "illegal", "ad", "abuse"):
+                recall_message = True
+            if action == "warn":
+                result = await self.tool_warn_user(group_id=group_id, user_id=user_id, violation_type=violation_type, reason=reason)
+                content = str(result.get("content", "")) if isinstance(result, dict) else ""
+                if content.startswith("已向"):
+                    if recall_message:
+                        await self._maybe_recall_audited_message(group_id, message_id, reason)
+                    await self._trigger_native_moderation_reply(stream_id, group_id, action, violation_type, reason)
+                return
+            duration = self._to_int(verdict.get("duration", 0))
+            if duration <= 0:
+                if violation_type == "spam":
+                    duration = 600
+                elif violation_type == "illegal":
+                    duration = 3600
+                else:
+                    duration = 1800
+            result = await self.tool_mute_user(group_id=group_id, user_id=user_id, duration=duration, reason=reason)
+            content = str(result.get("content", "")) if isinstance(result, dict) else ""
+            if content.startswith("已将"):
+                if recall_message:
+                    await self._maybe_recall_audited_message(group_id, message_id, reason)
+                await self._trigger_native_moderation_reply(stream_id, group_id, action, violation_type, reason)
+        except Exception as e:
+            self.ctx.logger.error(f"[群管理] 入站LLM审核异常: {e}", exc_info=True)
+        finally:
+            self._audit_tasks.pop(task_key or (group_id, user_id), None)
+
+    def _schedule_llm_moderation(
+        self,
+        group_id: int,
+        user_id: int,
+        text: str,
+        message_id: str = "",
+        stream_id: str = "",
+        audit_kind: str = "text",
+        forwarded_record_single_message: bool = False,
+    ):
+        if not text or group_id <= 0 or user_id <= 0:
+            return
+        seen_key = f"{audit_kind}:{message_id}" if message_id else ""
+        if seen_key:
+            if seen_key in self._audit_seen_messages:
+                return
+            self._audit_seen_messages[seen_key] = time.time()
+        key: tuple[Any, ...] = (group_id, user_id) if audit_kind == "text" else (group_id, user_id, audit_kind, message_id or str(time.time()))
+        history = self._recent_user_messages.setdefault(key, deque(maxlen=8))
+        history_snapshot = list(history)
+        history_text = "[QQ合并转发聊天记录，按单条消息计入近期历史]" if forwarded_record_single_message else text
+        existing = self._audit_tasks.get(key)
+        if existing and not existing.done():
+            history.append((time.time(), history_text))
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(f"[群管理] 入站LLM审核合并: group={group_id} user={user_id} pending=1")
+            return
+        history.append((time.time(), history_text))
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(f"[群管理] 入站LLM审核排队: group={group_id} user={user_id} text_len={len(text)}")
+        self._audit_tasks[key] = asyncio.create_task(
+            self._run_llm_moderation(
+                group_id,
+                user_id,
+                text,
+                stream_id,
+                message_id,
+                key,
+                forwarded_record_single_message,
+                history_snapshot,
+            )
+        )
 
     def _resolve_group_id_from_hook(self, kwargs: dict) -> int:
         """从 hook kwargs 中解析 group_id（强约束：显式字段+message_info+缓存）。"""
@@ -725,10 +1584,10 @@ class GroupAdminPlugin(MaiBotPlugin):
     # Tool: group_warn_user
     # =========================================================================
 
-    @Tool("group_warn_user", description="对指定群成员发出正式警告并记录, violation_type 为 spam(刷屏)/abuse(辱骂)/ad(广告)", parameters=[
+    @Tool("group_warn_user", description="对指定群成员发出正式警告并记录, violation_type 为 spam(刷屏)/abuse(辱骂)/ad(广告)/sexual(涉黄内容)/illegal(违法内容)", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
         ToolParameterInfo(name="user_id", param_type=ToolParamType.INTEGER, description="用户QQ号", required=True),
-        ToolParameterInfo(name="violation_type", param_type=ToolParamType.STRING, description="违规类型: spam/abuse/ad", required=True),
+        ToolParameterInfo(name="violation_type", param_type=ToolParamType.STRING, description="违规类型: spam/abuse/ad/sexual/illegal", required=True),
         ToolParameterInfo(name="reason", param_type=ToolParamType.STRING, description="警告原因(简要说明违规内容)", required=True),
     ])
     async def tool_warn_user(self, group_id: int = 0, user_id: int = 0, violation_type: str = "", reason: str = "", **kwargs: Any) -> dict[str, Any]:
@@ -742,9 +1601,20 @@ class GroupAdminPlugin(MaiBotPlugin):
             is_protected, msg = await self._is_protected(group_id, user_id)
             if is_protected: return {"name": "group_warn_user", "content": f"无法警告: {msg}"}
             self._warnings.setdefault(group_id, {}).setdefault(user_id, {}).setdefault(violation_type, []).append((time.time(), 1))
-            type_cn = {"spam": "刷屏", "abuse": "辱骂", "ad": "广告"}.get(violation_type, violation_type)
-            warn_text = f"⚠ 提醒: {reason}"
-            await self.ctx.send.text(warn_text, stream_id if stream_id else str(group_id))
+            type_cn = {
+                "spam": "刷屏",
+                "abuse": "辱骂",
+                "ad": "广告",
+                "sexual": "涉黄内容",
+                "illegal": "违法内容",
+            }.get(violation_type, violation_type)
+            warn_text = await self._generate_moderation_notice(violation_type, reason)
+            warn_text = f"⚠ {warn_text.lstrip('⚠ ').strip()}"
+            warn_stream_id = await self._resolve_group_stream_id(group_id, stream_id)
+            if warn_stream_id:
+                await self.ctx.send.text(warn_text, warn_stream_id)
+            else:
+                self.ctx.logger.warning(f"[群管理] 无法发送警告消息: group={group_id} user={user_id} reason={reason}")
             over, current, thresh = self._check_warning_threshold(group_id, user_id, violation_type)
             self._add_log(group_id, "warn", user_id, reason, True)
             extra = f"\n该用户 {type_cn} 类提醒已达 {current}/{thresh}，请注意是否需要升级处理。" if over else ""
@@ -1363,6 +2233,12 @@ class GroupAdminPlugin(MaiBotPlugin):
         self._disabled_groups.clear()
         self._get_member_called.clear()
         self._last_mute_time.clear()
+        self._recent_user_messages.clear()
+        for task in list(self._audit_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._audit_tasks.clear()
+        self._audit_seen_messages.clear()
 
     @Command("admin_reload", description="热重载配置", pattern=r"/admin\s+reload")
     async def cmd_admin_reload(self, stream_id: str = "", **kwargs: Any):
@@ -1558,6 +2434,9 @@ class GroupAdminPlugin(MaiBotPlugin):
             gi = mi.get("group_info", {}) or {}
             ac = mi.get("additional_config", {}) or {}
             group_id = self._to_int(gi.get("group_id", 0))
+            if not group_id:
+                mbi = message.get("message_base_info", {}) or {}
+                group_id = self._to_int(mbi.get("group_id", 0))
             self_id = ac.get("self_id")
             if self_id and not self._bot_self_id: self._bot_self_id = self._to_int(self_id)
             if group_id:
@@ -1566,6 +2445,32 @@ class GroupAdminPlugin(MaiBotPlugin):
                 if sid: self._stream_to_group[sid] = group_id
         if not group_id or not self._is_group_enabled(group_id): return {"continue_processing": True}
         await self._ensure_bot_role(group_id)
+        sender_id = self._extract_message_user_id(message, kwargs)
+        text = self._extract_message_text(message)
+        image_segments = self._extract_image_segments(message)
+        forwarded_record_single_message = (
+            self.config.auto_moderate.treat_forwarded_records_as_single_message
+            and self._is_forwarded_chat_record(message, text)
+        )
+        if forwarded_record_single_message:
+            text, image_segments = await self._expand_forwarded_record_for_audit(message, text, image_segments)
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(
+                f"[群管理] 入站消息: group={group_id} user={sender_id} text_len={len(text)} "
+                f"images={len(image_segments)} forwarded_record={forwarded_record_single_message} stream={stream_id}"
+            )
+        bot_id = self._to_int(self.config.identity.bot_qq) or self._bot_self_id or 0
+        if sender_id and sender_id != bot_id:
+            msg_id = str(message.get("message_id", "")) if isinstance(message, dict) else ""
+            self._schedule_llm_moderation(
+                group_id,
+                sender_id,
+                text,
+                msg_id,
+                stream_id,
+                forwarded_record_single_message=forwarded_record_single_message,
+            )
+            self._schedule_image_moderation(group_id, sender_id, image_segments, msg_id, stream_id)
         if time.time() - self._last_cleanup_time > 3600:
             self._cleanup_memory()
         return {"continue_processing": True}
@@ -1587,9 +2492,16 @@ class GroupAdminPlugin(MaiBotPlugin):
             return {"action": "continue"}
         mi = message.get("message_info", {}) or {}
         gi = mi.get("group_info", {}) or {}
+        ac = mi.get("additional_config", {}) or {}
         group_id = self._to_int(gi.get("group_id", 0))
+        if not group_id:
+            mbi = message.get("message_base_info", {}) or {}
+            group_id = self._to_int(mbi.get("group_id", 0))
         if group_id <= 0:
             return {"action": "continue"}
+        self_id = ac.get("self_id")
+        if self_id and not self._bot_self_id:
+            self._bot_self_id = self._to_int(self_id)
         msg_id = str(message.get("message_id", ""))
         for key in ("session_id", "stream_id", "chat_id"):
             sid = str(kwargs.get(key, ""))
@@ -1597,6 +2509,39 @@ class GroupAdminPlugin(MaiBotPlugin):
                 self._stream_to_group[sid] = group_id
         if msg_id:
             self._stream_to_group[msg_id] = group_id
+        if self.config.plugin.enabled and self.config.auto_moderate.enabled and self._is_group_enabled(group_id):
+            sender_id = self._extract_message_user_id(message, kwargs)
+            text = self._extract_message_text(message)
+            image_segments = self._extract_image_segments(message)
+            forwarded_record_single_message = (
+                self.config.auto_moderate.treat_forwarded_records_as_single_message
+                and self._is_forwarded_chat_record(message, text)
+            )
+            if forwarded_record_single_message:
+                text, image_segments = await self._expand_forwarded_record_for_audit(message, text, image_segments)
+            bot_id = self._to_int(self.config.identity.bot_qq) or self._bot_self_id or 0
+            stream_for_reply = ""
+            for key in ("session_id", "stream_id", "chat_id"):
+                sid = str(kwargs.get(key, ""))
+                if sid:
+                    stream_for_reply = sid
+                    break
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(
+                    f"[群管理] after_process入站: group={group_id} user={sender_id} "
+                    f"text_len={len(text)} images={len(image_segments)} "
+                    f"forwarded_record={forwarded_record_single_message} msg_id={msg_id} stream={stream_for_reply}"
+                )
+            if sender_id and sender_id != bot_id:
+                self._schedule_llm_moderation(
+                    group_id,
+                    sender_id,
+                    text,
+                    msg_id,
+                    stream_for_reply,
+                    forwarded_record_single_message=forwarded_record_single_message,
+                )
+                self._schedule_image_moderation(group_id, sender_id, image_segments, msg_id, stream_for_reply)
         return {"action": "continue"}
 
     # =========================================================================
