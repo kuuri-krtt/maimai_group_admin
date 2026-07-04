@@ -46,6 +46,10 @@ class CommandMixin:
         matched = matched_groups or {}
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
         if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        enabled_groups = [int(x) for x in self.config.auto_moderate.enabled_groups]
+        if gid in enabled_groups:
+            self.config.auto_moderate.enabled_groups = [str(g) for g in enabled_groups if g != gid]
+            await self._save_enabled_groups()
         self._disabled_groups.add(gid)
         await self.ctx.send.text(f"已关闭群 {gid} 的自动管理", stream_id)
         return True, "", True
@@ -57,9 +61,10 @@ class CommandMixin:
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
         enabled_groups = [int(x) for x in self.config.auto_moderate.enabled_groups]
         if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
-        if enabled_groups and gid not in enabled_groups:
-            await self.ctx.send.text(f"群 {gid} 不在 enabled_groups 白名单中", stream_id)
-            return True, "", True
+        if gid not in enabled_groups:
+            self.config.auto_moderate.enabled_groups.append(str(gid))
+            enabled_groups.append(gid)
+            await self._save_enabled_groups()
         self._disabled_groups.discard(gid)
         await self.ctx.send.text(f"已恢复群 {gid} 的自动管理", stream_id)
         return True, "", True
@@ -86,21 +91,13 @@ class CommandMixin:
         await self._send_at_text(stream_id, "已强制解禁", qq, "，同时移出豁免名单")
         return True, "", True
 
-    @Command("admin_log", description="查看操作记录 /admin log [群号|行数] [行数]", pattern=r"^/admin\s+log(?:\s+(?P<arg1>\d+))?(?:\s+(?P<arg2>\d+))?")
+    @Command("admin_log", description="查看操作记录 /admin log [群号] [行数]", pattern=r"^/admin\s+log(?:\s+(?P<group_id>\d+))?(?:\s+(?P<lines>\d+))?")
     async def cmd_admin_log(self, stream_id: str = "", user_id: str = "", matched_groups: dict | None = None, **kwargs: Any):
         self.ctx.logger.info(f"[群管理] Cmd-log: stream={stream_id}")
         matched = matched_groups or {}
-        arg1 = int(matched.get("arg1", 0) or 0)
-        arg2 = int(matched.get("arg2", 0) or 0)
-        gid = 0
-        n = self.config.logging.default_log_lines
-        for val in (arg1, arg2):
-            if val <= 0:
-                continue
-            if val >= 10000:
-                gid = val
-            else:
-                n = val
+        gid = int(matched.get("group_id", 0) or 0)
+        n_arg = int(matched.get("lines", 0) or 0)
+        n = n_arg if n_arg > 0 else self.config.logging.default_log_lines
         if not gid:
             gid = self._resolve_group_id(stream_id, kwargs)
         if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
@@ -319,7 +316,7 @@ class CommandMixin:
         if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
         msg_id = self._get_reply_msg_id(kwargs)
         if not msg_id: await self.ctx.send.text("请先回复目标消息再使用 /recall", stream_id); return True, "", True
-        ok, _ = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=self._to_int(msg_id))
+        ok, _ = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=msg_id)
         await self.ctx.send.text("已撤回" if ok else "撤回未能生效，请检查权限", stream_id)
         return True, "", True
 

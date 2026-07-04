@@ -96,7 +96,7 @@ class PromptsSectionConfig(PluginConfigBase):
         "\n"
         "身份：{bot_role}  可用操作：{available_actions}\n"
         "\n"
-        "发现违规时自然处理，不要解释操作、不要切换管理员口吻：\n"
+        "发现违规时自然处理，不要解释操作：\n"
         "  广告/诈骗 → 撤回 + 禁言10-30分钟\n"
         "  连续刷屏 → 提醒一句，仍继续再禁言5-10分钟\n"
         "  辱骂/人身攻击 → 撤回 + 禁言1-6小时，再犯踢出\n"

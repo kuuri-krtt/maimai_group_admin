@@ -37,8 +37,8 @@ class ToolMixin:
             if is_protected: return {"name": "group_warn_user", "content": f"无法警告: {msg}"}
             self._warnings.setdefault(group_id, {}).setdefault(user_id, {}).setdefault(violation_type, []).append((time.time(), 1))
             type_cn = {"spam": "刷屏", "abuse": "辱骂", "ad": "广告"}.get(violation_type, violation_type)
-            warn_text = f"⚠ 提醒: {reason}"
-            await self.ctx.send.text(warn_text, stream_id if stream_id else str(group_id))
+            if stream_id:
+                await self.ctx.send.text(f"⚠ 提醒: {reason}", stream_id)
             over, current, thresh = self._check_warning_threshold(group_id, user_id, violation_type)
             self._add_log(group_id, "warn", user_id, reason, True)
             extra = f"\n该用户 {type_cn} 类提醒已达 {current}/{thresh}，请注意是否需要升级处理。" if over else ""

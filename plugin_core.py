@@ -570,6 +570,23 @@ class PluginCore(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.error(f"[群管理] 持久化豁免名单失败: {e}", exc_info=True)
 
+    async def _save_enabled_groups(self):
+        try:
+            config_path = os.path.join(Path(__file__).parent, "config.toml")
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_data = tomlkit.load(f)
+            if "auto_moderate" not in config_data:
+                config_data["auto_moderate"] = tomlkit.table()
+            arr = tomlkit.array()
+            for g in self.config.auto_moderate.enabled_groups:
+                arr.append(g)
+            config_data["auto_moderate"]["enabled_groups"] = arr
+            with open(config_path, "w", encoding="utf-8") as f:
+                tomlkit.dump(config_data, f)
+            self.ctx.logger.info(f"[群管理] enabled_groups 已持久化到 config.toml")
+        except Exception as e:
+            self.ctx.logger.error(f"[群管理] 持久化 enabled_groups 失败: {e}", exc_info=True)
+
     def _clear_runtime_cache(self):
         self._group_roles.clear()
         self._role_refresh_time.clear()

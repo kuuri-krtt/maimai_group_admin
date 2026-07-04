@@ -128,17 +128,21 @@ class HandlerMixin:
     # 注入辅助
     # =========================================================================
 
-    async def _prepare_injection(self, **kwargs: Any) -> tuple[int, str, str] | None:
+    def _resolve_injection_group_id(self, **kwargs: Any) -> int:
         if not self.config.plugin.enabled or not self.config.auto_moderate.enabled:
-            return None
-        group_id = 0
+            return 0
         for key in ("reply_message_id", "session_id", "stream_id", "chat_id"):
             sid = str(kwargs.get(key, ""))
             if sid:
                 gid = self._stream_to_group.get(sid, 0)
                 if gid and self._is_group_enabled(gid):
-                    group_id = gid
-                    break
+                    return gid
+        return 0
+
+    async def _prepare_injection(self, **kwargs: Any) -> tuple[int, str, str] | None:
+        if not self.config.plugin.enabled or not self.config.auto_moderate.enabled:
+            return None
+        group_id = self._resolve_injection_group_id(**kwargs)
         if self.config.logging.verbose_logging:
             self.ctx.logger.info("[群管理] 注入检测: group_id=%s", group_id)
         if group_id <= 0:
@@ -233,16 +237,7 @@ class HandlerMixin:
         error_policy=ErrorPolicy.SKIP,
     )
     async def inject_admin_planner_prompt(self, **kwargs: Any):
-        if not self.config.plugin.enabled or not self.config.auto_moderate.enabled:
-            return {"action": "continue"}
-        group_id = 0
-        for key in ("reply_message_id", "session_id", "stream_id", "chat_id"):
-            sid = str(kwargs.get(key, ""))
-            if sid:
-                gid = self._stream_to_group.get(sid, 0)
-                if gid and self._is_group_enabled(gid):
-                    group_id = gid
-                    break
+        group_id = self._resolve_injection_group_id(**kwargs)
         if self.config.logging.verbose_logging:
             self.ctx.logger.info("[群管理] planner 注入检测: group_id=%s kwargs keys=%s stream_to_group keys=%s",
                 group_id, list(kwargs.keys()), list(self._stream_to_group.keys())[:10])
