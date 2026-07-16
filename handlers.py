@@ -67,6 +67,9 @@ class HandlerMixin:
             gi = mi.get("group_info", {}) or {}
             ac = mi.get("additional_config", {}) or {}
             group_id = self._to_int(gi.get("group_id", 0))
+            if not group_id:
+                mbi = message.get("message_base_info", {}) or {}
+                group_id = self._to_int(mbi.get("group_id", 0))
             self_id = ac.get("self_id")
             if self_id and not self._bot_self_id: self._bot_self_id = self._to_int(self_id)
             if group_id:
@@ -81,6 +84,54 @@ class HandlerMixin:
             self.ctx.logger.info("[群管理] EventHandler 追踪: group=%s stream_id=%s session_id in kwargs=%s", group_id, stream_id, bool(kwargs.get("session_id")))
         if not group_id or not self._is_group_enabled(group_id): return {"continue_processing": True}
         await self._ensure_bot_role(group_id)
+        sender_id = self._extract_message_user_id(message, kwargs)
+        text = self._extract_message_text(message)
+        image_segments = self._extract_image_segments(message, text)
+        is_forwarded_record = self._is_forwarded_chat_record(message, text)
+        forwarded_record_single_message = (
+            self.config.auto_moderate.treat_forwarded_records_as_single_message
+            and is_forwarded_record
+        )
+        if is_forwarded_record:
+            text, image_segments = await self._expand_forwarded_record_for_audit(message, text, image_segments)
+        if self.config.logging.verbose_logging:
+            self.ctx.logger.info(
+                "[群管理] 入站消息: group=%s user=%s text_len=%s images=%s forwarded_record=%s stream=%s",
+                group_id, sender_id, len(text), len(image_segments), forwarded_record_single_message, stream_id,
+            )
+            if not sender_id and isinstance(message, dict):
+                mi = message.get("message_info", {}) or {}
+                self.ctx.logger.info(
+                    "[群管理] 入站消息未解析到user_id: message_keys=%s message_info_keys=%s",
+                    list(message.keys())[:20],
+                    list(mi.keys())[:20] if isinstance(mi, dict) else type(mi).__name__,
+                )
+        bot_id = self._to_int(self.config.identity.bot_qq) or self._bot_self_id or 0
+        await self._remember_recent_group_manager_speaker(group_id, sender_id, bot_id)
+        if sender_id and sender_id != bot_id:
+            msg_id = str(message.get("message_id", "")) if isinstance(message, dict) else ""
+            stream_for_reply = stream_id
+            if not stream_for_reply and isinstance(message, dict):
+                sid = str(message.get("session_id", ""))
+                if sid:
+                    stream_for_reply = sid
+            self._schedule_llm_moderation(
+                group_id,
+                sender_id,
+                text,
+                msg_id,
+                stream_for_reply,
+                forwarded_record_single_message=forwarded_record_single_message,
+            )
+            self._schedule_image_moderation(
+                group_id,
+                sender_id,
+                image_segments,
+                msg_id,
+                stream_for_reply,
+                forwarded_record_single_message=forwarded_record_single_message,
+                forwarded_record_audit=is_forwarded_record,
+            )
         if time.time() - self._last_cleanup_time > 3600:
             self._cleanup_memory()
         return {"continue_processing": True}
@@ -102,9 +153,16 @@ class HandlerMixin:
             return {"action": "continue"}
         mi = message.get("message_info", {}) or {}
         gi = mi.get("group_info", {}) or {}
+        ac = mi.get("additional_config", {}) or {}
         group_id = self._to_int(gi.get("group_id", 0))
+        if not group_id:
+            mbi = message.get("message_base_info", {}) or {}
+            group_id = self._to_int(mbi.get("group_id", 0))
         if group_id <= 0:
             return {"action": "continue"}
+        self_id = ac.get("self_id") if isinstance(ac, dict) else None
+        if self_id and not self._bot_self_id:
+            self._bot_self_id = self._to_int(self_id)
         msg_id = str(message.get("message_id", ""))
         if msg_id:
             self._message_to_group[msg_id] = group_id
@@ -115,12 +173,60 @@ class HandlerMixin:
             sid2 = str(kwargs.get(key, ""))
             if sid2:
                 self._stream_to_group[sid2] = group_id
-        ac = mi.get("additional_config", {}) or {}
         if isinstance(ac, dict):
             for k in ("session_id", "stream_id", "chat_id"):
                 v = ac.get(k)
                 if v:
                     self._stream_to_group[str(v)] = group_id
+        if self.config.plugin.enabled and self.config.auto_moderate.enabled and self._is_group_enabled(group_id):
+            sender_id = self._extract_message_user_id(message, kwargs)
+            text = self._extract_message_text(message)
+            image_segments = self._extract_image_segments(message, text)
+            is_forwarded_record = self._is_forwarded_chat_record(message, text)
+            forwarded_record_single_message = (
+                self.config.auto_moderate.treat_forwarded_records_as_single_message
+                and is_forwarded_record
+            )
+            if is_forwarded_record:
+                text, image_segments = await self._expand_forwarded_record_for_audit(message, text, image_segments)
+            bot_id = self._to_int(self.config.identity.bot_qq) or self._bot_self_id or 0
+            stream_for_reply = sid
+            for key in ("session_id", "stream_id", "chat_id"):
+                sid2 = str(kwargs.get(key, ""))
+                if sid2:
+                    stream_for_reply = sid2
+                    break
+            if self.config.logging.verbose_logging:
+                self.ctx.logger.info(
+                    "[群管理] after_process入站: group=%s user=%s text_len=%s images=%s forwarded_record=%s msg_id=%s stream=%s",
+                    group_id, sender_id, len(text), len(image_segments), forwarded_record_single_message, msg_id, stream_for_reply,
+                )
+                if not sender_id:
+                    mi = message.get("message_info", {}) or {}
+                    self.ctx.logger.info(
+                        "[群管理] after_process未解析到user_id: message_keys=%s message_info_keys=%s",
+                        list(message.keys())[:20],
+                        list(mi.keys())[:20] if isinstance(mi, dict) else type(mi).__name__,
+                    )
+            await self._remember_recent_group_manager_speaker(group_id, sender_id, bot_id)
+            if sender_id and sender_id != bot_id:
+                self._schedule_llm_moderation(
+                    group_id,
+                    sender_id,
+                    text,
+                    msg_id,
+                    stream_for_reply,
+                    forwarded_record_single_message=forwarded_record_single_message,
+                )
+                self._schedule_image_moderation(
+                    group_id,
+                    sender_id,
+                    image_segments,
+                    msg_id,
+                    stream_for_reply,
+                    forwarded_record_single_message=forwarded_record_single_message,
+                    forwarded_record_audit=is_forwarded_record,
+                )
         self.ctx.logger.debug("[群管理] 缓存映射: group=%s msg=%s session=%s", group_id, msg_id, sid or "none")
         return {"action": "continue"}
 
