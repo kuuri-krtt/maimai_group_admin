@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import base64
 import json
 import re
@@ -11,7 +12,7 @@ import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar, Literal, Optional
 
 import tomlkit
 
@@ -22,6 +23,9 @@ from .config_model import (
     GroupAdminConfig,
     PromptsSectionConfig,
 )
+
+
+EmojiReviewState = Literal["passed", "banned", "needs_recheck", "unknown"]
 
 
 class PluginCore(MaiBotPlugin):
@@ -52,7 +56,7 @@ class PluginCore(MaiBotPlugin):
         self._recent_group_managers: dict[int, deque[tuple[float, int, str]]] = {}
         self._audit_tasks: dict[tuple[Any, ...], asyncio.Task] = {}
         self._audit_seen_messages: dict[str, float] = {}
-        self._seen_emoji_hashes: dict[str, float] = {}
+        self._seen_emoji_hashes: dict[tuple[int, str], float] = {}
         self._last_spam_action_time: dict[tuple[Any, ...], float] = {}
         self._host_persona_context: str = ""
         self._host_reply_style: str = ""
@@ -335,13 +339,13 @@ class PluginCore(MaiBotPlugin):
         for msg_id, ts in list(self._audit_seen_messages.items()):
             if now - ts > 900:
                 del self._audit_seen_messages[msg_id]
-        for image_hash, ts in list(self._seen_emoji_hashes.items()):
+        for image_key, ts in list(self._seen_emoji_hashes.items()):
             if now - ts > 86400:
-                del self._seen_emoji_hashes[image_hash]
+                del self._seen_emoji_hashes[image_key]
         if len(self._seen_emoji_hashes) > 5000:
             keys = sorted(self._seen_emoji_hashes.keys(), key=lambda k: self._seen_emoji_hashes[k])
-            for image_hash in keys[:len(keys) - 3000]:
-                del self._seen_emoji_hashes[image_hash]
+            for image_key in keys[:len(keys) - 3000]:
+                del self._seen_emoji_hashes[image_key]
         for key, ts in list(self._last_spam_action_time.items()):
             if now - ts > max(self.config.warning.spam_warn_window, 600):
                 del self._last_spam_action_time[key]
@@ -433,7 +437,7 @@ class PluginCore(MaiBotPlugin):
                 })
         return descriptions
 
-    def _extract_image_segments(self, message: Any, rendered_text: str = "") -> list[dict[str, str]]:
+    def _extract_media_segments(self, message: Any, rendered_text: str = "") -> list[dict[str, str]]:
         if not isinstance(message, dict):
             return []
         images: list[dict[str, str]] = []
@@ -524,7 +528,7 @@ class PluginCore(MaiBotPlugin):
                 add(match.group(1))
         return ids
 
-    def _merge_image_segments(self, first: list[dict[str, str]], second: list[dict[str, str]]) -> list[dict[str, str]]:
+    def _merge_media_segments(self, first: list[dict[str, str]], second: list[dict[str, str]]) -> list[dict[str, str]]:
         merged: list[dict[str, str]] = []
         seen: set[tuple[str, str, str, str, str]] = set()
         for image in [*first, *second]:
@@ -572,41 +576,41 @@ class PluginCore(MaiBotPlugin):
     def _render_forward_payload(self, payload: Any, depth: int = 0) -> tuple[str, list[dict[str, str]]]:
         if depth > 8:
             return "", []
-        images: list[dict[str, str]] = []
+        media_items: list[dict[str, str]] = []
         lines: list[str] = []
         if isinstance(payload, dict):
-            images = self._merge_image_segments(images, self._extract_image_segments(payload))
+            media_items = self._merge_media_segments(media_items, self._extract_media_segments(payload))
             for list_key in ("messages", "nodes", "forward", "forward_messages"):
                 items = payload.get(list_key)
                 if isinstance(items, list):
                     for item in items:
-                        text, nested_images = self._render_forward_payload(item, depth + 1)
+                        text, nested_media = self._render_forward_payload(item, depth + 1)
                         if text:
                             lines.append(text)
-                        images = self._merge_image_segments(images, nested_images)
-                    return "\n".join(lines).strip(), images
+                        media_items = self._merge_media_segments(media_items, nested_media)
+                    return "\n".join(lines).strip(), media_items
             content = payload.get("content") or payload.get("message")
             if content:
-                text, nested_images = self._render_forward_payload(content, depth + 1)
-                images = self._merge_image_segments(images, nested_images)
+                text, nested_media = self._render_forward_payload(content, depth + 1)
+                media_items = self._merge_media_segments(media_items, nested_media)
                 if text:
                     sender = str(payload.get("name") or payload.get("nickname") or payload.get("user_id") or "").strip()
-                    return (f"{sender}: {text}" if sender else text), images
-            return self._render_forward_payload_text(payload, depth + 1), images
+                    return (f"{sender}: {text}" if sender else text), media_items
+            return self._render_forward_payload_text(payload, depth + 1), media_items
         if isinstance(payload, list):
             for item in payload:
-                text, nested_images = self._render_forward_payload(item, depth + 1)
+                text, nested_media = self._render_forward_payload(item, depth + 1)
                 if text:
                     lines.append(text)
-                images = self._merge_image_segments(images, nested_images)
-            return "\n".join(lines).strip(), images
-        return self._render_forward_payload_text(payload, depth + 1), images
+                media_items = self._merge_media_segments(media_items, nested_media)
+            return "\n".join(lines).strip(), media_items
+        return self._render_forward_payload_text(payload, depth + 1), media_items
 
-    async def _expand_forwarded_record_for_audit(self, message: Any, text: str, images: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
-        if not getattr(self.config.auto_moderate, "expand_forwarded_records", True):
-            return text, images
-        rendered_text, rendered_images = self._render_forward_payload(message)
-        merged_images = self._merge_image_segments(images, rendered_images)
+    async def _expand_forwarded_record_for_audit(self, message: Any, text: str, media_items: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+        if not getattr(self.config.moderation_behavior, "expand_forwarded_records", True):
+            return text, media_items
+        rendered_text, rendered_media = self._render_forward_payload(message)
+        merged_media = self._merge_media_segments(media_items, rendered_media)
         forward_ids = self._extract_forward_record_ids(message, text)
         for forward_id in forward_ids[:3]:
             for api_name in ("adapter.napcat.message.get_forward_msg", "adapter.napcat.message.get_forward_message"):
@@ -614,14 +618,14 @@ class PluginCore(MaiBotPlugin):
                 if not ok:
                     ok, data = await self._call_action_api(api_name=api_name, message_id=forward_id)
                 if ok:
-                    extra_text, extra_images = self._render_forward_payload(data)
+                    extra_text, extra_media = self._render_forward_payload(data)
                     if extra_text:
                         rendered_text = f"{rendered_text}\n{extra_text}".strip()
-                    merged_images = self._merge_image_segments(merged_images, extra_images)
+                    merged_media = self._merge_media_segments(merged_media, extra_media)
                     break
         if rendered_text:
-            return f"[QQ合并转发]\n{rendered_text}", merged_images
-        return text, merged_images
+            return f"[QQ合并转发]\n{rendered_text}", merged_media
+        return text, merged_media
 
     def _decode_image_base64(self, image_base64: str) -> bytes:
         payload = str(image_base64 or "").strip()
@@ -749,11 +753,45 @@ class PluginCore(MaiBotPlugin):
             return result
         return {"success": ok, "response": str(result)}
 
+    async def _classify_vlm_description_status(self, description: str, image_type: str = "image", image_hash: str = "") -> str:
+        text = str(description or "").strip()
+        if not text:
+            return "timeout"
+        if not bool(getattr(self.config.media_audit, "violation_media_text_judge_enabled", True)):
+            return "ok"
+        model = str(getattr(self.config.auto_moderate, "audit_model", "utils") or "utils").strip() or "utils"
+        prompt = (
+            "你是图片审核流水线的元判定器，只判断一段 VLM 图片描述文本的性质。\n"
+            "任务：判断这段文本属于正常图片内容描述、模型明确拒绝识图，还是普通识图失败。\n"
+            "不要根据图片是否违规来判断；即使描述了色情、暴力、违法内容，只要仍在描述图片内容，就属于 ok。\n"
+            "rejected 仅用于：文本明确表达模型因安全、政策、违规、拒答边界而拒绝描述或分析图片。\n"
+            "failure 用于：文本表示看不清、无法识别、没有识别出内容、无法判断图片内容等非拒答失败。\n"
+            "如果不确定，返回 ok。\n\n"
+            f"image_type: {image_type}\n"
+            f"image_hash_prefix: {str(image_hash or '')[:12]}\n"
+            f"description:\n{text[:1200]}\n\n"
+            '只输出 JSON：{"status":"ok|rejected|failure","reason":"一句很短的中文理由"}'
+        )
+        try:
+            result = await self._llm_generate(prompt, model, temperature=0.0, max_tokens=80)
+            raw = str(result.get("response", "") if isinstance(result, dict) else result).strip()
+            match = re.search(r"\{.*\}", raw, re.S)
+            data = json.loads(match.group(0) if match else raw)
+            status = str(data.get("status", "ok") or "ok").strip().lower()
+            if status in ("rejected", "failure"):
+                if self.config.logging.verbose_logging:
+                    reason = str(data.get("reason", "") or "").strip()
+                    self.ctx.logger.info(f"[群管理] VLM描述状态判定: hash={str(image_hash or '')[:12]} status={status} reason={reason}")
+                return status
+        except Exception as e:
+            self.ctx.logger.warning(f"[群管理] VLM描述状态判定失败，按正常描述处理: hash={str(image_hash or '')[:12]} error={e}")
+        return "ok"
+
     def _persona_comments_enabled(self) -> bool:
-        return bool(getattr(self.config.auto_moderate, "persona_managed_comments_enabled", False))
+        return bool(getattr(self.config.moderation_behavior, "persona_managed_comments_enabled", False))
 
     def _persona_comments_model(self) -> str:
-        return str(getattr(self.config.auto_moderate, "persona_managed_comments_model", "replyer") or "replyer").strip() or "replyer"
+        return str(getattr(self.config.moderation_behavior, "persona_managed_comments_model", "replyer") or "replyer").strip() or "replyer"
 
     @staticmethod
     def _build_notice_task_context() -> str:
@@ -855,10 +893,16 @@ class PluginCore(MaiBotPlugin):
         return fallback
 
     async def _send_persona_text(self, stream_id: str, fallback: str, kind: str = "command_success", context: str = "", max_chars: int = 120) -> None:
+        if kind in {"command_success", "command_failure", "usage_hint", "permission_denied"}:
+            await self.ctx.send.text(str(fallback or ""), stream_id)
+            return
         text = await self._generate_persona_managed_comment(kind, context or fallback, fallback, max_chars=max_chars)
         await self.ctx.send.text(text, stream_id)
 
     async def _send_persona_at_text(self, stream_id: str, prefix: str, qq: int, suffix: str = "", kind: str = "command_success", context: str = "", max_chars: int = 120) -> None:
+        if kind in {"command_success", "command_failure", "usage_hint", "permission_denied"}:
+            await self._send_at_text(stream_id, prefix, qq, suffix)
+            return
         if not self._persona_comments_enabled():
             await self._send_at_text(stream_id, prefix, qq, suffix)
             return
@@ -945,27 +989,47 @@ class PluginCore(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.warning(f"[群管理] 自动撤回失败: group={group_id} message={message_id}: {e}")
 
-    async def _get_image_description_for_audit(self, image_info: dict[str, str], timeout: float = 12.0, image_index: int = 0) -> str:
+    async def _get_media_description_for_audit(self, image_info: dict[str, str], timeout: float = 12.0, image_index: int = 0, notify_on_description_failure: bool = False) -> tuple[str, str]:
         image_type = str(image_info.get("type") or "image").strip().lower()
         image_hash = str(image_info.get("hash") or "").strip()
         image_base64 = str(image_info.get("base64") or "").strip()
         image_url = str(image_info.get("url") or "").strip()
         rendered_description = str(image_info.get("description") or "").strip()
-        retry_unrecognized_media = bool(getattr(self.config.auto_moderate, "retry_unrecognized_media_with_image_audit", True))
+        retry_unrecognized_media = bool(getattr(self.config.media_audit, "retry_violation_media_with_image_audit", True))
 
-        rejected_emoji = False
-        rejected_emoji_bytes: bytes | None = None
+        emoji_review_state: EmojiReviewState = "unknown"
+        emoji_recheck_image_bytes: bytes | None = None
         if retry_unrecognized_media and image_type == "emoji" and image_hash:
-            rejected_emoji, rejected_emoji_bytes = await self._get_rejected_emoji_image_bytes(image_hash)
+            emoji_review_state, emoji_recheck_image_bytes = await self._get_emoji_review_state(image_hash)
 
-        if image_type == "emoji" and not rejected_emoji:
+        emoji_needs_recheck = emoji_review_state == "needs_recheck" and emoji_recheck_image_bytes is not None
+
+        def cacheable_status(status: str) -> str:
+            if image_type == "emoji" and retry_unrecognized_media and image_hash and emoji_review_state == "unknown" and status == "ok":
+                return "ok_uncached"
+            return status
+
+        if image_type == "emoji" and not emoji_needs_recheck:
             if rendered_description:
-                return rendered_description
+                status = await self._classify_vlm_description_status(rendered_description, image_type, image_hash)
+                if status != "rejected":
+                    return rendered_description, cacheable_status(status)
+                return rendered_description, "rejected"
             emoji_desc = await self._get_emoji_description_for_audit(image_hash, image_base64)
             if emoji_desc:
-                return emoji_desc
+                status = await self._classify_vlm_description_status(emoji_desc, image_type, image_hash)
+                if status != "rejected":
+                    return emoji_desc, cacheable_status(status)
+                return emoji_desc, "rejected"
         if image_type != "emoji" and rendered_description:
-            return rendered_description
+            status = await self._classify_vlm_description_status(rendered_description, image_type, image_hash)
+            if status != "rejected":
+                return rendered_description, status
+            return rendered_description, "rejected"
+
+        if notify_on_description_failure:
+            self.ctx.logger.info(f"[group-admin] media description unavailable; notify_on_media_description_failure enabled, skip forced VLM/LLM recheck: index={image_index} hash={image_hash[:12]}")
+            return "", "timeout"
 
         stored_image_bytes: bytes | None = None
         if retry_unrecognized_media and image_type != "emoji" and image_hash:
@@ -975,56 +1039,81 @@ class PluginCore(MaiBotPlugin):
             from src.chat.image_system.image_manager import image_manager
         except Exception as e:
             self.ctx.logger.warning(f"[群管理] 无法导入图片描述管理器: {e}")
-            return ""
+            return "", "timeout"
 
-        async def read_once() -> str:
-            if rejected_emoji and rejected_emoji_bytes:
-                desc = await image_manager.get_image_description(image_bytes=rejected_emoji_bytes, wait_for_build=True)
-                if desc:
-                    return f"主程序表情包审核未通过；图片识别：{str(desc).strip()}"
-            if image_hash:
-                desc = await image_manager.get_image_description(image_hash=image_hash, wait_for_build=True)
-                if desc:
-                    text = str(desc).strip()
-                    return f"主程序表情包审核未通过；图片识别：{text}" if rejected_emoji else text
+        forced_description_sources: set[str] = set()
+
+        async def force_describe_bytes(image_bytes: bytes, source_key: str) -> str:
+            if not image_bytes:
+                return ""
+            if source_key in forced_description_sources:
+                return ""
+            forced_description_sources.add(source_key)
+            try:
+                saved_image = await image_manager.ensure_image_saved(image_bytes)
+                if not getattr(saved_image, "image_format", ""):
+                    await saved_image.calculate_hash_format()
+                image_format = str(getattr(saved_image, "image_format", "") or "")
+                if not image_format:
+                    return ""
+                desc = await image_manager._generate_image_description(image_bytes, image_format)
+                return str(desc or "").strip()
+            except Exception as e:
+                if self.config.logging.verbose_logging:
+                    self.ctx.logger.info(f"[group-admin] violation media VLM forced recheck failed: index={image_index} hash={image_hash[:12]} error={e}")
+                return ""
+
+        async def read_once() -> tuple[str, bool]:
+            if emoji_recheck_image_bytes:
+                text = await force_describe_bytes(emoji_recheck_image_bytes, "emoji_recheck")
+                if text:
+                    return text, True
             if stored_image_bytes:
-                desc = await image_manager.get_image_description(image_bytes=stored_image_bytes, wait_for_build=True)
-                if desc:
-                    return str(desc).strip()
+                text = await force_describe_bytes(stored_image_bytes, "stored")
+                if text:
+                    return text, True
             if image_base64:
-                desc = await image_manager.get_image_description(image_bytes=self._decode_image_base64(image_base64), wait_for_build=True)
-                if desc:
-                    text = str(desc).strip()
-                    return f"主程序表情包审核未通过；图片识别：{text}" if rejected_emoji else text
+                text = await force_describe_bytes(self._decode_image_base64(image_base64), "base64")
+                if text:
+                    return text, True
             if image_url:
                 image_bytes = await asyncio.to_thread(self._download_image_url_sync, image_url)
                 if image_bytes:
-                    desc = await image_manager.get_image_description(image_bytes=image_bytes, wait_for_build=True)
-                    if desc:
-                        text = str(desc).strip()
-                        return f"主程序表情包审核未通过；图片识别：{text}" if rejected_emoji else text
-            return ""
+                    text = await force_describe_bytes(image_bytes, "url")
+                    if text:
+                        return text, True
+            if image_hash:
+                desc = await image_manager.get_image_description(image_hash=image_hash, wait_for_build=True)
+                if desc:
+                    return str(desc).strip(), False
+            return "", False
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                desc = await asyncio.wait_for(read_once(), timeout=max(0.5, min(3.0, deadline - time.time())))
+                desc, forced_recheck = await asyncio.wait_for(read_once(), timeout=max(0.5, min(3.0, deadline - time.time())))
                 if desc:
-                    return desc
+                    status = await self._classify_vlm_description_status(desc, image_type, image_hash)
+                    if status == "rejected":
+                        self.ctx.logger.info(f"[group-admin] violation media VLM recheck rejected: index={image_index} hash={image_hash[:12]} forced={forced_recheck} text={desc[:500]}")
+                        return desc, "rejected"
+                    if status == "failure":
+                        self.ctx.logger.info(f"[group-admin] violation media VLM recheck failed to describe: index={image_index} hash={image_hash[:12]} forced={forced_recheck} text={desc[:500]}")
+                    return desc, cacheable_status(status)
             except Exception:
                 if not image_hash:
                     break
             await asyncio.sleep(0.5)
-        if rejected_emoji and rendered_description:
-            return f"主程序表情包审核未通过；表情包标签：{rendered_description}"
-        if self.config.logging.verbose_logging:
-            self.ctx.logger.info(f"[群管理] 图片描述为空或超时: index={image_index} hash={image_hash[:12]}")
-        return ""
+        if emoji_needs_recheck:
+            self.ctx.logger.info(f"[group-admin] violation media recheck timed out or empty: index={image_index} hash={image_hash[:12]} state={emoji_review_state}")
+            return "", "timeout"
+        self.ctx.logger.info(f"[群管理] 图片描述为空或超时，跳过人工通知: index={image_index} hash={image_hash[:12]}")
+        return "", "timeout"
 
-    async def _get_rejected_emoji_image_bytes(self, image_hash: str) -> tuple[bool, bytes | None]:
+    async def _get_emoji_review_state(self, image_hash: str) -> tuple[EmojiReviewState, bytes | None]:
         image_hash = str(image_hash or "").strip()
         if not image_hash:
-            return False, None
+            return "unknown", None
         try:
             from sqlmodel import select
             from src.common.database.database import get_db_session
@@ -1032,27 +1121,36 @@ class PluginCore(MaiBotPlugin):
             from src.common.utils.image_path import resolve_stored_image_path
         except Exception as e:
             if self.config.logging.verbose_logging:
-                self.ctx.logger.info(f"[群管理] 无法读取表情包数据库状态: {e}")
-            return False, None
+                self.ctx.logger.info(f"[group-admin] failed to read emoji review database state: {e}")
+            return "unknown", None
+
         try:
             with get_db_session() as session:
                 statement = select(Images).filter_by(image_hash=image_hash, image_type=ImageType.EMOJI).limit(1)
                 record = session.exec(statement).first()
                 if record is None:
-                    return False, None
-                rejected = bool(record.is_banned) or (bool(record.vlm_processed) and not bool(record.is_registered))
-                if not rejected:
-                    return False, None
+                    return "unknown", None
+
+                if bool(record.is_banned):
+                    return "banned", None
+                if bool(record.is_registered):
+                    return "passed", None
+                if not bool(record.vlm_processed):
+                    return "unknown", None
                 if bool(record.no_file_flag) or not str(record.full_path or "").strip():
-                    return True, None
+                    return "unknown", None
                 image_path = resolve_stored_image_path(record.full_path)
+
             if not image_path.is_file():
-                return True, None
-            return True, await asyncio.to_thread(image_path.read_bytes)
+                return "unknown", None
+            image_bytes = await asyncio.to_thread(image_path.read_bytes)
+            if not image_bytes:
+                return "unknown", None
+            return "needs_recheck", image_bytes
         except Exception as e:
             if self.config.logging.verbose_logging:
-                self.ctx.logger.info(f"[群管理] 读取未通过表情包原图失败: hash={image_hash[:12]} error={e}")
-            return False, None
+                self.ctx.logger.info(f"[group-admin] failed to read emoji review state: hash={image_hash[:12]} error={e}")
+            return "unknown", None
 
     async def _get_stored_image_bytes_for_audit(self, image_hash: str, image_type: str = "image") -> bytes | None:
         image_hash = str(image_hash or "").strip()
@@ -1117,61 +1215,78 @@ class PluginCore(MaiBotPlugin):
                 return tag_text
         return ""
 
-    async def _run_image_moderation(self, group_id: int, user_id: int, images: list[dict[str, str]], stream_id: str = "", message_id: str = "", forwarded_record_single_message: bool = False, forwarded_record_audit: bool = False) -> None:
+    async def _run_media_moderation(self, group_id: int, user_id: int, media_items: list[dict[str, str]], stream_id: str = "", message_id: str = "", forwarded_record_single_message: bool = False, forwarded_record_audit: bool = False) -> None:
         try:
             is_protected, protected_reason = await self._is_protected(group_id, user_id)
             if is_protected:
                 if self.config.logging.verbose_logging:
                     self.ctx.logger.info(f"[群管理] 图片审核跳过受保护用户: group={group_id} user={user_id} reason={protected_reason}")
                 return
-            image_limit = self._to_int(getattr(self.config.auto_moderate, "forwarded_image_audit_max_images" if forwarded_record_audit else "image_audit_max_images", 4))
-            if image_limit <= 0:
-                image_limit = 8 if forwarded_record_audit else 4
+            media_limit = self._to_int(getattr(self.config.media_audit, "forwarded_media_audit_max_items" if forwarded_record_audit else "media_audit_max_items", 4))
+            if media_limit <= 0:
+                media_limit = 8 if forwarded_record_audit else 4
             try:
-                description_timeout = float(getattr(self.config.auto_moderate, "image_description_timeout", 12.0))
+                description_timeout = float(getattr(self.config.media_audit, "media_description_timeout", 12.0))
             except Exception:
                 description_timeout = 12.0
             description_timeout = max(3.0, min(description_timeout, 60.0))
-            unknown_policy = str(getattr(self.config.auto_moderate, "image_unknown_policy", "none") or "none").strip().lower()
+            violation_media_policy = str(getattr(self.config.media_audit, "violation_media_policy", "none") or "none").strip().lower()
+            notify_on_media_description_failure = bool(getattr(self.config.media_audit, "notify_on_media_description_failure", False))
             descriptions: list[str] = []
-            unreadable: list[str] = []
+            review_required: list[str] = []
             counts = {"图片": 0, "表情包": 0}
             audited_count = 0
-            for index, image_info in enumerate(images, start=1):
+            seen_media_keys: set[tuple[str, str]] = set()
+            for index, image_info in enumerate(media_items, start=1):
                 image_type = str(image_info.get("type") or "image").strip().lower()
                 label = "表情包" if image_type == "emoji" else "图片"
                 image_hash = str(image_info.get("hash") or "").strip()
-                if image_type == "emoji" and image_hash and image_hash in self._seen_emoji_hashes:
+                media_identity = (
+                    image_hash
+                    or str(image_info.get("url") or "").strip()
+                    or str(image_info.get("base64") or "").strip()[:96]
+                    or str(image_info.get("description") or "").strip()[:96]
+                )
+                if media_identity:
+                    media_key = (image_type, media_identity)
+                    if media_key in seen_media_keys:
+                        continue
+                    seen_media_keys.add(media_key)
+                emoji_seen_key = (group_id, image_hash)
+                if image_type == "emoji" and image_hash and emoji_seen_key in self._seen_emoji_hashes:
                     continue
-                if audited_count >= image_limit:
+                if audited_count >= media_limit:
                     break
                 audited_count += 1
-                if image_type == "emoji" and image_hash:
-                    self._seen_emoji_hashes[image_hash] = time.time()
-                desc = await self._get_image_description_for_audit(image_info, timeout=description_timeout, image_index=index)
-                if desc:
+                desc, desc_status = await self._get_media_description_for_audit(image_info, timeout=description_timeout, image_index=index, notify_on_description_failure=notify_on_media_description_failure)
+                if image_type == "emoji" and image_hash and desc_status in ("ok", "rejected"):
+                    self._seen_emoji_hashes[emoji_seen_key] = time.time()
+                if desc and desc_status != "failure":
                     descriptions.append(f"{index}. type={label} hash={image_hash[:12] or 'unknown'} 描述：{desc}")
-                else:
-                    unreadable.append(f"{index}. type={label} hash={image_hash[:12] or 'unknown'} 描述状态：为空或超时，无法确认{label}内容")
+                if desc_status == "rejected":
+                    review_required.append(f"{index}. type={label} hash={image_hash[:12] or 'unknown'} 描述状态：模型明确拒绝识图，需人工确认{label}内容")
                     counts[label] = counts.get(label, 0) + 1
-            if unreadable and unknown_policy == "notify_admin":
-                await self._notify_group_manager_for_image_unknown(
+                elif desc_status in ("failure", "timeout") and notify_on_media_description_failure:
+                    review_required.append(f"{index}. type={label} hash={image_hash[:12] or 'unknown'} 描述状态：识图失败/空返回/超时，需人工确认{label}内容")
+                    counts[label] = counts.get(label, 0) + 1
+            if review_required and violation_media_policy == "notify":
+                await self._notify_violation_media_review_target(
                     group_id,
                     user_id,
                     stream_id,
                     message_id,
-                    len(unreadable),
-                    ",".join(unreadable),
-                    self._format_unreadable_kind(counts),
-                    self._format_unreadable_kind_detail(counts),
+                    len(review_required),
+                    ",".join(review_required),
+                    self._format_review_required_kind(counts),
+                    self._format_review_required_kind_detail(counts),
                 )
-            if not descriptions and unknown_policy != "warn":
+            if not descriptions and violation_media_policy != "warn":
                 return
             audit_lines = []
             if descriptions:
                 audit_lines.append("[图片消息] 图片描述：\n" + "\n".join(descriptions))
-            if unreadable:
-                audit_lines.append("[图片描述失败]\n" + "\n".join(unreadable))
+            if review_required:
+                audit_lines.append("[图片/表情需要人工复核]\n" + "\n".join(review_required))
             if audit_lines:
                 self._schedule_llm_moderation(
                     group_id,
@@ -1185,16 +1300,30 @@ class PluginCore(MaiBotPlugin):
         except Exception as e:
             self.ctx.logger.error(f"[群管理] 图片审核异常: {e}", exc_info=True)
 
-    def _schedule_image_moderation(self, group_id: int, user_id: int, images: list[dict[str, str]], message_id: str = "", stream_id: str = "", forwarded_record_single_message: bool = False, forwarded_record_audit: bool = False) -> None:
-        if not getattr(self.config.auto_moderate, "audit_images", True):
+    def _schedule_media_moderation(self, group_id: int, user_id: int, media_items: list[dict[str, str]], message_id: str = "", stream_id: str = "", forwarded_record_single_message: bool = False, forwarded_record_audit: bool = False) -> None:
+        audit_regular_images = bool(getattr(self.config.media_audit, "audit_regular_images", True))
+        audit_emojis = bool(getattr(self.config.media_audit, "audit_emojis", True))
+        if not audit_regular_images and not audit_emojis:
             return
-        if not images or group_id <= 0 or user_id <= 0:
+        if not media_items or group_id <= 0 or user_id <= 0:
             return
+        media_items = [
+            image
+            for image in media_items
+            if (audit_emojis if str(image.get("type") or "image").strip().lower() == "emoji" else audit_regular_images)
+        ]
+        if not media_items:
+            return
+        seen_key = f"media:{message_id}" if message_id else ""
+        if seen_key:
+            if seen_key in self._audit_seen_messages:
+                return
+            self._audit_seen_messages[seen_key] = time.time()
         key: tuple[Any, ...] = (group_id, user_id, "image", message_id or str(time.time()))
         if key in self._audit_tasks and not self._audit_tasks[key].done():
             return
         self._audit_tasks[key] = asyncio.create_task(
-            self._run_image_moderation(group_id, user_id, images, stream_id, message_id, forwarded_record_single_message, forwarded_record_audit)
+            self._run_media_moderation(group_id, user_id, media_items, stream_id, message_id, forwarded_record_single_message, forwarded_record_audit)
         )
 
     def _recent_message_history_maxlen(self) -> int:
@@ -1204,6 +1333,9 @@ class PluginCore(MaiBotPlugin):
     def _recent_message_count_for_spam(self, group_id: int, user_id: int, now: float, window: int) -> int:
         history = self._recent_user_messages.get((group_id, user_id), deque())
         return sum(1 for ts, _text in history if now - ts <= window)
+
+    def _treat_forwarded_records_as_single_message(self) -> bool:
+        return bool(getattr(self.config.warning, "treat_forwarded_records_as_single_message", True))
 
     def _has_recent_spam_warning(self, group_id: int, user_id: int, now: float, window: int) -> bool:
         warnings = self._warnings.get(group_id, {}).get(user_id, {}).get("spam", [])
@@ -1235,28 +1367,12 @@ class PluginCore(MaiBotPlugin):
         warn_key = (group_id, user_id, "spam_warn")
         escalation_key = (group_id, user_id, "spam_escalation")
         if count > threshold and self._has_recent_spam_warning(group_id, user_id, now, window):
-            if self.config.escalation.enabled and self.config.escalation.escalation_steps:
-                action_cooldown = max(self._to_int(getattr(self.config.safeguard, "mute_cooldown", 0)), 30)
-                if now - self._last_spam_action_time.get(escalation_key, 0.0) >= action_cooldown:
-                    esc = self._check_escalation(group_id, user_id, pending_count=1)
-                    if esc:
-                        self._last_spam_action_time[escalation_key] = now
-                        if str(getattr(esc, "action", "") or "").strip().lower() == "kick":
-                            self.ctx.logger.info(f"[群管理] 刷屏处罚阶梯建议踢出，自动路径不执行禁言: group={group_id} user={user_id}")
-                            target_stream = await self._resolve_group_stream_id(group_id, stream_id)
-                            if target_stream:
-                                await self._send_persona_text(
-                                    target_stream,
-                                    "该用户已达处罚阶梯要求，应踢出而非禁言，请使用 group_kick_user",
-                                    "command_failure",
-                                    f"用户 {user_id} 已触发刷屏处罚阶梯的踢出档，提示应改用 group_kick_user，不自动执行踢出或禁言",
-                                )
-                            return
-                        duration = self._to_int(getattr(esc, "max_duration", 0))
-                        if duration <= 0:
-                            duration = min(600, self._to_int(getattr(self.config.safeguard, "max_mute_duration", 600)) or 600)
-                        await self.tool_mute_user(group_id=group_id, user_id=user_id, duration=duration, reason=reason)
-                        return
+            action_cooldown = max(self._to_int(getattr(self.config.safeguard, "mute_cooldown", 0)), 30)
+            if now - self._last_spam_action_time.get(escalation_key, 0.0) >= action_cooldown:
+                self._last_spam_action_time[escalation_key] = now
+                duration = min(600, self._to_int(getattr(self.config.safeguard, "max_mute_duration", 600)) or 600)
+                await self.tool_mute_user(group_id=group_id, user_id=user_id, duration=duration, reason=reason)
+                return
             if now - self._last_spam_action_time.get(warn_key, 0.0) >= min(max(window, 60), 300):
                 self._last_spam_action_time[warn_key] = now
                 await self.tool_warn_user(group_id=group_id, user_id=user_id, violation_type="spam", reason=reason, stream_id=stream_id)
@@ -1340,9 +1456,9 @@ class PluginCore(MaiBotPlugin):
                 duration = self._to_int(verdict.get("duration", 0))
                 duration = self._normalize_audit_mute_duration(violation_type, duration)
                 await self.tool_mute_user(group_id=group_id, user_id=user_id, duration=duration, reason=reason)
-            if recall_message and getattr(self.config.auto_moderate, "auto_recall", False):
+            if recall_message and getattr(self.config.moderation_behavior, "auto_recall", False):
                 await self._maybe_recall_audited_message(group_id, message_id, reason)
-            if getattr(self.config.auto_moderate, "trigger_moderation_reply", True):
+            if getattr(self.config.moderation_behavior, "trigger_moderation_reply", True):
                 await self._trigger_native_moderation_reply(stream_id, group_id, action, violation_type, reason)
         except Exception as e:
             self.ctx.logger.error(f"[群管理] 入站LLM审核异常: {e}", exc_info=True)
@@ -1413,7 +1529,7 @@ class PluginCore(MaiBotPlugin):
         return 0
 
     @staticmethod
-    def _format_unreadable_kind(type_counts: dict[str, int]) -> str:
+    def _format_review_required_kind(type_counts: dict[str, int]) -> str:
         image_count = int(type_counts.get("图片", 0) or 0)
         emoji_count = int(type_counts.get("表情包", 0) or 0)
         if image_count and emoji_count:
@@ -1423,7 +1539,7 @@ class PluginCore(MaiBotPlugin):
         return "图片"
 
     @staticmethod
-    def _format_unreadable_kind_detail(type_counts: dict[str, int]) -> str:
+    def _format_review_required_kind_detail(type_counts: dict[str, int]) -> str:
         parts: list[str] = []
         image_count = int(type_counts.get("图片", 0) or 0)
         emoji_count = int(type_counts.get("表情包", 0) or 0)
@@ -1433,31 +1549,31 @@ class PluginCore(MaiBotPlugin):
             parts.append(f"{emoji_count}个表情包")
         return "和".join(parts) if parts else "0张图片/表情包"
 
-    async def _generate_image_unknown_notice(self, unreadable_count: int, unreadable_kind: str = "图片", unreadable_kind_detail: str = "") -> str:
-        unreadable_kind = str(unreadable_kind or "图片").strip() or "图片"
-        unreadable_kind_detail = str(unreadable_kind_detail or "").strip() or f"{unreadable_count}个{unreadable_kind}"
-        fallback = f" 有{unreadable_kind_detail}没有完成识别，麻烦人工看一下要不要处理。"
+    async def _generate_violation_media_review_notice(self, review_required_count: int, review_required_kind: str = "图片", review_required_kind_detail: str = "") -> str:
+        review_required_kind = str(review_required_kind or "图片").strip() or "图片"
+        review_required_kind_detail = str(review_required_kind_detail or "").strip() or f"{review_required_count}个{review_required_kind}"
+        fallback = f" 有{review_required_kind_detail}需要人工复核，麻烦看一下要不要处理。"
         if not self._persona_comments_enabled():
             return fallback
-        prompt_template = str(getattr(self.config.prompts, "image_unknown_notice_prompt", "") or "").strip()
+        prompt_template = str(getattr(self.config.prompts, "violation_media_notice_prompt", "") or "").strip()
         if not prompt_template:
-            prompt_template = PromptsSectionConfig().image_unknown_notice_prompt
+            prompt_template = PromptsSectionConfig().violation_media_notice_prompt
         system_prompt = await self._build_host_persona_context()
         try:
             prompt = prompt_template.format(
                 bot_style_context="请严格遵守系统消息中的 MaiBot 身份、人格设定、表达方式与群管理呼叫任务边界。",
                 bot_nickname=str(getattr(self.config.identity, "bot_nickname", "") or "麦麦"),
-                unreadable_count=unreadable_count,
-                unreadable_kind=unreadable_kind,
-                unreadable_kind_detail=unreadable_kind_detail,
+                review_required_count=review_required_count,
+                review_required_kind=review_required_kind,
+                review_required_kind_detail=review_required_kind_detail,
             )
         except Exception:
-            prompt = PromptsSectionConfig().image_unknown_notice_prompt.format(
+            prompt = PromptsSectionConfig().violation_media_notice_prompt.format(
                 bot_style_context="请严格遵守系统消息中的 MaiBot 身份、人格设定、表达方式与群管理呼叫任务边界。",
                 bot_nickname=str(getattr(self.config.identity, "bot_nickname", "") or "麦麦"),
-                unreadable_count=unreadable_count,
-                unreadable_kind=unreadable_kind,
-                unreadable_kind_detail=unreadable_kind_detail,
+                review_required_count=review_required_count,
+                review_required_kind=review_required_kind,
+                review_required_kind_detail=review_required_kind_detail,
             )
         try:
             model = self._persona_comments_model()
@@ -1470,20 +1586,36 @@ class PluginCore(MaiBotPlugin):
             self.ctx.logger.warning(f"[群管理] 生成管理员通知失败: {e}")
         return fallback
 
-    async def _notify_group_manager_for_image_unknown(self, group_id: int, user_id: int, stream_id: str, message_id: str, unreadable_count: int, unreadable_summary: str = "", unreadable_kind: str = "图片", unreadable_kind_detail: str = "") -> bool:
+    async def _resolve_violation_media_notify_target(self, group_id: int, user_id: int, bot_id: int = 0) -> int:
+        target = str(getattr(self.config.media_audit, "violation_media_notify_target", "") or "").strip().lower()
+        if not target:
+            target = "admin_or_owner"
+        if target.isdigit():
+            return self._to_int(target)
+        if target == "admin":
+            return self._find_recent_group_manager_for_notice(group_id, exclude_user_id=user_id, bot_id=bot_id)
+        if target == "owner":
+            return await self._find_group_owner_for_notice(group_id, bot_id=bot_id)
+        if target == "admin_or_owner":
+            manager_id = self._find_recent_group_manager_for_notice(group_id, exclude_user_id=user_id, bot_id=bot_id)
+            if manager_id:
+                return manager_id
+            return await self._find_group_owner_for_notice(group_id, bot_id=bot_id)
+        self.ctx.logger.warning(f"[群管理] violation_media_notify_target 无效: {target}")
+        return 0
+
+    async def _notify_violation_media_review_target(self, group_id: int, user_id: int, stream_id: str, message_id: str, review_required_count: int, review_required_summary: str = "", review_required_kind: str = "图片", review_required_kind_detail: str = "") -> bool:
         bot_id = self._to_int(self.config.identity.bot_qq) or self._bot_self_id or 0
-        manager_id = self._find_recent_group_manager_for_notice(group_id, exclude_user_id=user_id, bot_id=bot_id)
-        if not manager_id and bool(getattr(self.config.auto_moderate, "image_unknown_notify_owner", True)):
-            manager_id = await self._find_group_owner_for_notice(group_id, bot_id=bot_id)
+        manager_id = await self._resolve_violation_media_notify_target(group_id, user_id, bot_id=bot_id)
         if not manager_id:
             return False
         target_stream = await self._resolve_group_stream_id(group_id, stream_id)
         if not target_stream:
             return False
-        suffix = await self._generate_image_unknown_notice(unreadable_count, unreadable_kind, unreadable_kind_detail)
+        suffix = await self._generate_violation_media_review_notice(review_required_count, review_required_kind, review_required_kind_detail)
         await self._send_at_text(target_stream, "", manager_id, suffix)
         if self.config.logging.verbose_logging:
-            self.ctx.logger.info(f"[群管理] 已通知管理员人工复核图片: group={group_id} user={user_id} manager={manager_id} mid={message_id} unreadable={unreadable_count} details={unreadable_summary}")
+            self.ctx.logger.info(f"[群管理] 已通知人工复核违规图片/表情: group={group_id} user={user_id} manager={manager_id} mid={message_id} review_required={review_required_count} details={review_required_summary}")
         return True
 
     def _get_group_role(self, group_id: int) -> Optional[str]:

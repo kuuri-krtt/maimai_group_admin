@@ -86,18 +86,18 @@ class HandlerMixin:
         await self._ensure_bot_role(group_id)
         sender_id = self._extract_message_user_id(message, kwargs)
         text = self._extract_message_text(message)
-        image_segments = self._extract_image_segments(message, text)
+        media_segments = self._extract_media_segments(message, text)
         is_forwarded_record = self._is_forwarded_chat_record(message, text)
         forwarded_record_single_message = (
-            self.config.auto_moderate.treat_forwarded_records_as_single_message
+            self._treat_forwarded_records_as_single_message()
             and is_forwarded_record
         )
         if is_forwarded_record:
-            text, image_segments = await self._expand_forwarded_record_for_audit(message, text, image_segments)
+            text, media_segments = await self._expand_forwarded_record_for_audit(message, text, media_segments)
         if self.config.logging.verbose_logging:
             self.ctx.logger.info(
-                "[群管理] 入站消息: group=%s user=%s text_len=%s images=%s forwarded_record=%s stream=%s",
-                group_id, sender_id, len(text), len(image_segments), forwarded_record_single_message, stream_id,
+                "[群管理] 入站消息: group=%s user=%s text_len=%s media=%s forwarded_record=%s stream=%s",
+                group_id, sender_id, len(text), len(media_segments), forwarded_record_single_message, stream_id,
             )
             if not sender_id and isinstance(message, dict):
                 mi = message.get("message_info", {}) or {}
@@ -123,10 +123,10 @@ class HandlerMixin:
                 stream_for_reply,
                 forwarded_record_single_message=forwarded_record_single_message,
             )
-            self._schedule_image_moderation(
+            self._schedule_media_moderation(
                 group_id,
                 sender_id,
-                image_segments,
+                media_segments,
                 msg_id,
                 stream_for_reply,
                 forwarded_record_single_message=forwarded_record_single_message,
@@ -181,14 +181,14 @@ class HandlerMixin:
         if self.config.plugin.enabled and self.config.auto_moderate.enabled and self._is_group_enabled(group_id):
             sender_id = self._extract_message_user_id(message, kwargs)
             text = self._extract_message_text(message)
-            image_segments = self._extract_image_segments(message, text)
+            media_segments = self._extract_media_segments(message, text)
             is_forwarded_record = self._is_forwarded_chat_record(message, text)
             forwarded_record_single_message = (
-                self.config.auto_moderate.treat_forwarded_records_as_single_message
+                self._treat_forwarded_records_as_single_message()
                 and is_forwarded_record
             )
             if is_forwarded_record:
-                text, image_segments = await self._expand_forwarded_record_for_audit(message, text, image_segments)
+                text, media_segments = await self._expand_forwarded_record_for_audit(message, text, media_segments)
             bot_id = self._to_int(self.config.identity.bot_qq) or self._bot_self_id or 0
             stream_for_reply = sid
             for key in ("session_id", "stream_id", "chat_id"):
@@ -198,8 +198,8 @@ class HandlerMixin:
                     break
             if self.config.logging.verbose_logging:
                 self.ctx.logger.info(
-                    "[群管理] after_process入站: group=%s user=%s text_len=%s images=%s forwarded_record=%s msg_id=%s stream=%s",
-                    group_id, sender_id, len(text), len(image_segments), forwarded_record_single_message, msg_id, stream_for_reply,
+                    "[群管理] after_process入站: group=%s user=%s text_len=%s media=%s forwarded_record=%s msg_id=%s stream=%s",
+                    group_id, sender_id, len(text), len(media_segments), forwarded_record_single_message, msg_id, stream_for_reply,
                 )
                 if not sender_id:
                     mi = message.get("message_info", {}) or {}
@@ -218,10 +218,10 @@ class HandlerMixin:
                     stream_for_reply,
                     forwarded_record_single_message=forwarded_record_single_message,
                 )
-                self._schedule_image_moderation(
+                self._schedule_media_moderation(
                     group_id,
                     sender_id,
-                    image_segments,
+                    media_segments,
                     msg_id,
                     stream_for_reply,
                     forwarded_record_single_message=forwarded_record_single_message,
