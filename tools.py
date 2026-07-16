@@ -22,10 +22,10 @@ class ToolMixin:
     # Tool: group_warn_user
     # =========================================================================
 
-    @Tool("group_warn_user", description="向群成员发出正式警告并记录违规类型(spam/abuse/ad)（管理员/群主可用）", parameters=[
+    @Tool("group_warn_user", description="向群成员发出正式警告并记录违规类型(spam/abuse/ad/sexual/illegal)", parameters=[
         ToolParameterInfo(name="group_id", param_type=ToolParamType.INTEGER, description="群号", required=True),
         ToolParameterInfo(name="user_id", param_type=ToolParamType.INTEGER, description="用户QQ号", required=True),
-        ToolParameterInfo(name="violation_type", param_type=ToolParamType.STRING, description="违规类型: spam(刷屏)/abuse(辱骂)/ad(广告)", required=True),
+        ToolParameterInfo(name="violation_type", param_type=ToolParamType.STRING, description="违规类型: spam(刷屏)/abuse(辱骂)/ad(广告)/sexual(色情低俗)/illegal(违法风险)", required=True),
         ToolParameterInfo(name="reason", param_type=ToolParamType.STRING, description="警告原因", required=True),
     ])
     async def tool_warn_user(self, group_id: int = 0, user_id: int = 0, violation_type: str = "", reason: str = "", **kwargs: Any) -> dict[str, Any]:
@@ -44,9 +44,22 @@ class ToolMixin:
             is_protected, msg = await self._is_protected(group_id, user_id)
             if is_protected: return {"name": "group_warn_user", "content": f"无法警告: {msg}"}
             self._warnings.setdefault(group_id, {}).setdefault(user_id, {}).setdefault(violation_type, []).append((time.time(), 1))
-            type_cn = {"spam": "刷屏", "abuse": "辱骂", "ad": "广告"}.get(violation_type, violation_type)
-            if stream_id:
-                await self.ctx.send.text(f"⚠ 提醒: {reason}", stream_id)
+            type_cn = {
+                "spam": "刷屏",
+                "abuse": "辱骂",
+                "ad": "广告",
+                "sexual": "色情低俗",
+                "illegal": "违法风险",
+            }.get(violation_type, violation_type)
+            try:
+                warn_text = await self._generate_moderation_notice(violation_type, reason)
+            except Exception:
+                warn_text = f"提醒一下：{reason}"
+            target_stream = stream_id or await self._resolve_group_stream_id(group_id)
+            if target_stream:
+                await self.ctx.send.text(self._apply_warning_reply_prefix(warn_text), target_stream)
+            else:
+                self.ctx.logger.warning(f"[群管理] 无法定位警告发送会话: group={group_id} user={user_id} reason={reason}")
             over, current, thresh = self._check_warning_threshold(group_id, user_id, violation_type)
             self._add_log(group_id, "warn", user_id, reason, True)
             extra = f"\n该用户 {type_cn} 类提醒已达 {current}/{thresh}，请注意是否需要升级处理。" if over else ""
