@@ -12,6 +12,13 @@ from maibot_sdk import Command
 class CommandMixin:
     """15 个管理员命令（8 个 /admin 系列 + 7 个快捷操作）。"""
 
+    def _permission_command_text(self, kwargs: dict[str, Any], fallback: str) -> str:
+        for key in ("text", "raw_message", "message_text"):
+            value = kwargs.get(key)
+            if value:
+                return str(value)
+        return fallback
+
     # =========================================================================
     # Command: /admin 系列 (8个)
     # =========================================================================
@@ -21,7 +28,8 @@ class CommandMixin:
         self.ctx.logger.info(f"[群管理] Cmd-status: stream={stream_id}")
         matched = matched_groups or {}
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "admin status")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         role = self._get_group_role(gid)
         if role is None and gid: role = await self._ensure_bot_role(gid)
         role = role or "未知"
@@ -45,7 +53,8 @@ class CommandMixin:
         self.ctx.logger.info(f"[群管理] Cmd-off: stream={stream_id}")
         matched = matched_groups or {}
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "admin off")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         enabled_groups = [int(x) for x in self.config.auto_moderate.enabled_groups]
         if gid in enabled_groups:
             self.config.auto_moderate.enabled_groups = [str(g) for g in enabled_groups if g != gid]
@@ -60,7 +69,8 @@ class CommandMixin:
         matched = matched_groups or {}
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
         enabled_groups = [int(x) for x in self.config.auto_moderate.enabled_groups]
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "admin on")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         if gid not in enabled_groups:
             self.config.auto_moderate.enabled_groups.append(str(gid))
             enabled_groups.append(gid)
@@ -80,8 +90,12 @@ class CommandMixin:
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
         qq = int(matched.get("qq", 0))
         if not qq: await self.ctx.send.text("用法: /admin undo [群号] @qq", stream_id); return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
-        await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=0)
+        command_text = self._permission_command_text(kwargs, "admin undo")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
+        ok, _ = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=0)
+        if not ok:
+            await self.ctx.send.text("强制解禁未能生效，请检查权限", stream_id)
+            return True, "", True
         exempt = self.config.safeguard.exempt_users
         gid_str = str(gid)
         if gid_str in exempt and str(qq) in exempt[gid_str]:
@@ -100,7 +114,8 @@ class CommandMixin:
         n = n_arg if n_arg > 0 else self.config.logging.default_log_lines
         if not gid:
             gid = self._resolve_group_id(stream_id, kwargs)
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "admin log")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         entries = list(self._op_log)
         if gid: entries = [e for e in entries if e["group_id"] == gid]
         entries = entries[-n:]
@@ -124,7 +139,8 @@ class CommandMixin:
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
         qq = int(matched.get("qq", 0))
         if not qq: await self.ctx.send.text("用法: /admin ban [群号] @qq", stream_id); return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "admin ban")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         exempt = self.config.safeguard.exempt_users
         gid_str = str(gid); exempt.setdefault(gid_str, [])
         if str(qq) not in exempt[gid_str]:
@@ -144,7 +160,8 @@ class CommandMixin:
         gid = int(matched.get("group_id", 0) or 0) or self._resolve_group_id(stream_id, kwargs)
         qq = int(matched.get("qq", 0))
         if not qq: await self.ctx.send.text("用法: /admin unban [群号] @qq", stream_id); return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "admin unban")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         exempt = self.config.safeguard.exempt_users
         gid_str = str(gid)
         if gid_str in exempt and str(qq) in exempt[gid_str]:
@@ -182,9 +199,10 @@ class CommandMixin:
         target = (matched.get("target") or "").strip(); duration = int(matched.get("duration", 0) or 0)
         unit = (matched.get("unit") or "分钟").strip(); reason = (matched.get("reason") or "").strip()
         if not target or duration <= 0: await self.ctx.send.text("用法: /mute @qq或昵称 N分钟 [原因]", stream_id); return True, "", True
+        command_text = self._permission_command_text(kwargs, "mute")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         qq = await self._resolve_target(gid, target, stream_id)
         if not qq: return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
         if unit in ("小时", "h"): duration *= 3600
         elif unit in ("秒", "s"): pass
         else: duration *= 60
@@ -228,9 +246,10 @@ class CommandMixin:
         gid = self._resolve_group_id(stream_id, kwargs)
         target = (matched.get("target") or "").strip()
         if not target: await self.ctx.send.text("用法: /unmute @qq或昵称", stream_id); return True, "", True
+        command_text = self._permission_command_text(kwargs, "unmute")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         qq = await self._resolve_target(gid, target, stream_id)
         if not qq: return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
         ok, _ = await self._call_api(api_name="adapter.napcat.group.set_group_ban", group_id=gid, user_id=qq, duration=0)
         if ok: await self._send_at_text(stream_id, "已解除", qq, "的禁言")
         else: await self.ctx.send.text("解禁未能生效，请检查权限", stream_id)
@@ -243,9 +262,10 @@ class CommandMixin:
         gid = self._resolve_group_id(stream_id, kwargs)
         target = (matched.get("target") or "").strip(); reason = (matched.get("reason") or "").strip()
         if not target: await self.ctx.send.text("用法: /kick @qq或昵称 [原因]", stream_id); return True, "", True
+        command_text = self._permission_command_text(kwargs, "kick")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         qq = await self._resolve_target(gid, target, stream_id)
         if not qq: return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
         is_protected, msg = await self._is_protected(gid, qq)
         if is_protected: await self.ctx.send.text(f"操作被拦截: {msg}", stream_id); return True, "", True
         esc = self._check_escalation(gid, qq)
@@ -273,9 +293,10 @@ class CommandMixin:
         gid = self._resolve_group_id(stream_id, kwargs)
         target = (matched.get("target") or "").strip(); vtype = (matched.get("type") or "").strip(); reason = (matched.get("reason") or "").strip()
         if not target or not vtype: await self.ctx.send.text("用法: /warn @qq或昵称 spam/abuse/ad [原因]", stream_id); return True, "", True
+        command_text = self._permission_command_text(kwargs, "warn")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         qq = await self._resolve_target(gid, target, stream_id)
         if not qq: return True, "", True
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
         async with self._lock:
             self._warnings.setdefault(gid, {}).setdefault(qq, {}).setdefault(vtype, []).append((time.time(), 1))
         self._add_log(gid, "warn", qq, reason or "管理员命令", True)
@@ -302,7 +323,8 @@ class CommandMixin:
     async def cmd_admin_essence(self, stream_id: str = "", user_id: str = "", **kwargs: Any):
         self.ctx.logger.info(f"[群管理] Cmd-essence: stream={stream_id}")
         gid = self._resolve_group_id(stream_id, kwargs)
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "essence")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         msg_id = self._get_reply_msg_id(kwargs)
         if not msg_id: await self.ctx.send.text("请先回复目标消息再使用 /essence", stream_id); return True, "", True
         ok, _ = await self._call_action_api(api_name="adapter.napcat.group.set_essence_msg", group_id=gid, message_id=msg_id)
@@ -313,10 +335,11 @@ class CommandMixin:
     async def cmd_admin_recall(self, stream_id: str = "", user_id: str = "", **kwargs: Any):
         self.ctx.logger.info(f"[群管理] Cmd-recall: stream={stream_id}")
         gid = self._resolve_group_id(stream_id, kwargs)
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "recall")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         msg_id = self._get_reply_msg_id(kwargs)
         if not msg_id: await self.ctx.send.text("请先回复目标消息再使用 /recall", stream_id); return True, "", True
-        ok, _ = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=msg_id)
+        ok, _ = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=self._to_int(msg_id))
         await self.ctx.send.text("已撤回" if ok else "撤回未能生效，请检查权限", stream_id)
         return True, "", True
 
@@ -324,7 +347,8 @@ class CommandMixin:
     async def cmd_admin_shutlist(self, stream_id: str = "", user_id: str = "", **kwargs: Any):
         self.ctx.logger.info(f"[群管理] Cmd-shutlist: stream={stream_id}")
         gid = self._resolve_group_id(stream_id, kwargs)
-        if not await self._check_admin_permission(stream_id, gid, user_id): return True, "", True
+        command_text = self._permission_command_text(kwargs, "shutlist")
+        if not await self._check_admin_permission(stream_id, gid, user_id, command_text): return True, "", True
         ok, data = await self._call_action_api(api_name="adapter.napcat.group.get_group_shut_list", group_id=gid)
         if ok and isinstance(data, dict): await self.ctx.send.text(f"禁言列表: {data.get('data', data)}", stream_id)
         else: await self.ctx.send.text("查询未能生效，请稍后重试", stream_id)

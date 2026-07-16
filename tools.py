@@ -13,6 +13,11 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 class ToolMixin:
     """18 个群管理 Tool。"""
 
+    def _tool_group_scope_denied(self, tool_name: str, group_id: int) -> dict[str, Any] | None:
+        if not self._is_group_enabled(group_id):
+            return {"name": tool_name, "content": f"群 {group_id} 未启用群管理，已拒绝执行该工具"}
+        return None
+
     # =========================================================================
     # Tool: group_warn_user
     # =========================================================================
@@ -30,6 +35,9 @@ class ToolMixin:
         user_id = self._to_int(user_id)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_warn_user", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_warn_user", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-warn: group={group_id} user={user_id} type={violation_type}")
         async with self._lock:
             await self._check_daily_reset(group_id)
@@ -61,6 +69,9 @@ class ToolMixin:
         duration = self._to_int(duration)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_mute_user", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_mute_user", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-mute: group={group_id} user={user_id} dur={duration}s")
         async with self._lock:
             await self._check_daily_reset(group_id)
@@ -108,6 +119,9 @@ class ToolMixin:
         user_id = self._to_int(user_id)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_unmute_user", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_unmute_user", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-unmute: group={group_id} user={user_id}")
         async with self._lock:
             try:
@@ -133,6 +147,9 @@ class ToolMixin:
         user_id = self._to_int(user_id)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_kick_user", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_kick_user", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-kick: group={group_id} user={user_id}")
         async with self._lock:
             await self._check_daily_reset(group_id)
@@ -179,6 +196,9 @@ class ToolMixin:
         user_id = self._to_int(user_id)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_set_user_card", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_set_user_card", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-card: group={group_id} user={user_id}")
         async with self._lock:
             is_protected, msg = await self._is_protected(group_id, user_id)
@@ -206,6 +226,9 @@ class ToolMixin:
         user_id = self._to_int(user_id)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_set_title", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_set_title", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-title: group={group_id} user={user_id}")
         async with self._lock:
             is_protected, msg = await self._is_protected(group_id, user_id)
@@ -231,6 +254,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_set_name", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_set_name", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-setname: group={group_id} name={name}")
         async with self._lock:
             try:
@@ -255,6 +281,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_approve_join", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_approve_join", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-approve: group={group_id} req={request_id}")
         async with self._lock:
             await self._check_daily_reset(group_id)
@@ -285,6 +314,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_reject_join", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_reject_join", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-reject: group={group_id} req={request_id}")
         async with self._lock:
             await self._check_daily_reset(group_id)
@@ -316,6 +348,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_post_notice", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_post_notice", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-notice-post: group={group_id}")
         async with self._lock:
             try:
@@ -343,6 +378,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_delete_notice", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_delete_notice", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-notice-del: group={group_id}")
         async with self._lock:
             try:
@@ -362,6 +400,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_set_essence", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_set_essence", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-essence-set: group={group_id}")
         async with self._lock:
             try:
@@ -381,6 +422,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_unset_essence", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_unset_essence", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-essence-del: group={group_id}")
         async with self._lock:
             try:
@@ -401,10 +445,13 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_recall_msg", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_recall_msg", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-recall: group={group_id} mid={message_id}")
         async with self._lock:
             try:
-                ok, data = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=message_id)
+                ok, data = await self._call_api(api_name="adapter.napcat.message.delete_msg", message_id=self._to_int(message_id))
                 if not ok: return {"name": "group_recall_msg", "content": f"撤回未能生效: {data}"}
                 return {"name": "group_recall_msg", "content": f"已撤回消息 {message_id}: {reason}"}
             except Exception:
@@ -421,6 +468,9 @@ class ToolMixin:
         user_id = self._to_int(user_id)
         if group_id <= 0 or user_id <= 0:
             return {"name": "group_get_member", "content": "无效的 group_id 或 user_id"}
+        denied = self._tool_group_scope_denied("group_get_member", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-get-member: group={group_id} user={user_id}")
         async with self._lock:
             self._get_member_called.setdefault(group_id, {})[user_id] = time.time()
@@ -443,6 +493,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_get_shut_list", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_get_shut_list", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-get-shutlist: group={group_id}")
         async with self._lock:
             try:
@@ -461,6 +514,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_get_notice", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_get_notice", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-get-notice: group={group_id}")
         async with self._lock:
             try:
@@ -480,6 +536,9 @@ class ToolMixin:
         group_id = self._to_int(group_id)
         if group_id <= 0:
             return {"name": "group_get_system_msg", "content": "无效的 group_id"}
+        denied = self._tool_group_scope_denied("group_get_system_msg", group_id)
+        if denied:
+            return denied
         self.ctx.logger.info(f"[群管理] Tool-get-sysmsg: group={group_id}")
         async with self._lock:
             try:

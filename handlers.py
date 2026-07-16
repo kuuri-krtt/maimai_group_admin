@@ -48,7 +48,7 @@ class HandlerMixin:
         for key in ("reply_message_id", "session_id", "stream_id", "chat_id"):
             sid = str(kwargs.get(key, ""))
             if sid:
-                gid = self._stream_to_group.get(sid, 0)
+                gid = self._message_to_group.get(sid, 0) if key == "reply_message_id" else self._stream_to_group.get(sid, 0)
                 if gid > 0:
                     return gid
         return 0
@@ -107,7 +107,7 @@ class HandlerMixin:
             return {"action": "continue"}
         msg_id = str(message.get("message_id", ""))
         if msg_id:
-            self._stream_to_group[msg_id] = group_id
+            self._message_to_group[msg_id] = group_id
         sid = str(message.get("session_id", ""))
         if sid:
             self._stream_to_group[sid] = group_id
@@ -134,7 +134,7 @@ class HandlerMixin:
         for key in ("reply_message_id", "session_id", "stream_id", "chat_id"):
             sid = str(kwargs.get(key, ""))
             if sid:
-                gid = self._stream_to_group.get(sid, 0)
+                gid = self._message_to_group.get(sid, 0) if key == "reply_message_id" else self._stream_to_group.get(sid, 0)
                 if gid and self._is_group_enabled(gid):
                     return gid
         return 0

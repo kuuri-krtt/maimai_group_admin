@@ -31,6 +31,7 @@ class PluginCore(MaiBotPlugin):
         self._known_roles: dict[tuple[int, int], tuple[str, float]] = {}
         self._bot_self_id: Optional[int] = None
         self._stream_to_group: dict[str, int] = {}
+        self._message_to_group: dict[str, int] = {}
         self._disabled_groups: set[int] = set()
         self._daily_mute_count: dict[int, dict[str, int]] = {}
         self._daily_kick_count: dict[int, dict[str, int]] = {}
@@ -278,6 +279,10 @@ class PluginCore(MaiBotPlugin):
             keys = list(self._stream_to_group.keys())
             for k in keys[:-500]:
                 del self._stream_to_group[k]
+        if len(self._message_to_group) > 2000:
+            keys = list(self._message_to_group.keys())
+            for k in keys[:-1000]:
+                del self._message_to_group[k]
         mute_cooldown_max = max(self.config.safeguard.mute_cooldown, 300) * 3
         for k in list(self._last_mute_time.keys()):
             if now - self._last_mute_time[k] > mute_cooldown_max:
@@ -428,14 +433,16 @@ class PluginCore(MaiBotPlugin):
         cutoff = datetime.now() - timedelta(hours=window_hours)
         return sum(1 for e in self._op_log if e["group_id"] == group_id and e["target_user_id"] == user_id and e["action"] in ("warn", "mute", "kick") and datetime.fromisoformat(e["timestamp"]) > cutoff)
 
-    def _check_escalation(self, group_id: int, user_id: int) -> Optional[EscalationStepConfig]:
+    def _check_escalation(self, group_id: int, user_id: int, pending_count: int = 0) -> Optional[EscalationStepConfig]:
         if not self.config.escalation.enabled: return None
         steps = self.config.escalation.escalation_steps
         if not steps: return None
+        matched: Optional[EscalationStepConfig] = None
         for step in steps:
-            if self._count_ops_in_window(group_id, user_id, float(step.within_hours)) >= int(step.count):
-                return step
-        return None
+            if self._count_ops_in_window(group_id, user_id, float(step.within_hours)) + max(0, pending_count) >= int(step.count):
+                if matched is None or int(step.count) > int(matched.count):
+                    matched = step
+        return matched
 
     def _check_warning_threshold(self, group_id: int, user_id: int, violation_type: str) -> tuple[bool, int, int]:
         wc = self.config.warning
@@ -451,6 +458,8 @@ class PluginCore(MaiBotPlugin):
 
     def _resolve_group_id(self, stream_id: str, kwargs: dict = None) -> int:
         gid = self._stream_to_group.get(stream_id, 0)
+        if not gid:
+            gid = self._message_to_group.get(stream_id, 0)
         if gid:
             return gid
         if not kwargs:
@@ -489,12 +498,13 @@ class PluginCore(MaiBotPlugin):
         if target.isdigit(): return int(target)
         try:
             ok, data = await self._call_api(api_name="adapter.napcat.group.get_group_member_list", group_id=gid)
-            if ok and isinstance(data, list):
-                for m in data:
+            members = data.get("data") if isinstance(data, dict) else data
+            if ok and isinstance(members, list):
+                for m in members:
                     if not isinstance(m, dict): continue
                     nick = str(m.get("nickname", ""))
                     card = str(m.get("card", ""))
-                    uid = str(m.get("user_id", ""))
+                    uid = str(m.get("user_id") or m.get("userId") or m.get("qq") or m.get("uin") or "")
                     if target.lower() in (nick.lower(), card.lower()):
                         return self._to_int(uid)
         except Exception as e:
@@ -592,6 +602,7 @@ class PluginCore(MaiBotPlugin):
         self._role_refresh_time.clear()
         self._known_roles.clear()
         self._stream_to_group.clear()
+        self._message_to_group.clear()
         self._disabled_groups.clear()
         self._get_member_called.clear()
         self._last_mute_time.clear()
